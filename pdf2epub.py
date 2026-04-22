@@ -13,6 +13,7 @@ Dependencias: pypdf pdfminer.six PyMuPDF pytesseract pillow
 import argparse
 import io
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -106,8 +107,8 @@ small { font-size: 0.8em; }
 
 /* === IMÁGENES === */
 img {
-    max-width: 100vw;
-    max-height: 100vh;
+    max-width: 100%;
+    max-height: 95vh;
     width: auto;
     height: auto;
     margin-top: 0;
@@ -121,15 +122,21 @@ img {
 div.dimg {
     width: auto;
     height: auto;
-    max-width: 100vw;
-    max-height: 100vh;
+    max-width: 100%;
     margin-right: auto;
     margin-left: auto;
     line-height: 0;
     text-align: center;
+    margin-top: 1em;
+    margin-bottom: 1em;
 }
-div.pagina  { width: 100%; height: 100%; }
+div.dimg.fullblock img {
+    max-height: 80vh;
+}
+div.pagina  { width: 100%; height: auto; text-align: center; }
 div.seguida { width: 100%; height: auto; }
+div.galeria { width: 100%; height: auto; text-align: center; }
+div.galeria .dimg { margin-top: 0.6em; margin-bottom: 0.6em; }
 
 /* === ALINEACIÓN === */
 .centrado,  .centrado p  { text-align: center; text-indent: 0; }
@@ -200,9 +207,28 @@ XHTML_IMAGE_PAGE_TEMPLATE = """\
 
 <body>
 <div class="pagina">
-  <div class="dimg">
+  <div class="dimg fullblock">
     <img alt="{alt}" src="../Images/{imgname}"/>
   </div>{caption_html}
+</div>
+</body>
+</html>
+"""
+
+XHTML_IMAGE_SEQUENCE_TEMPLATE = """\
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{lang}">
+<head>
+  <title>{title}</title>
+  <link href="../Styles/style.css" rel="stylesheet" type="text/css"/>
+</head>
+
+<body>
+<div class="galeria">
+{body}
 </div>
 </body>
 </html>
@@ -433,6 +459,77 @@ def apply_ocr_to_pages(pdf_path: str, raw_pages: list[str], config: dict) -> tup
     return replaced, stats
 
 
+def _decorative_image_hash(img: dict) -> str:
+    return hashlib.sha1(img.get("data", b"")).hexdigest()
+
+
+def _filter_decorative_images(images: list[dict], total_pages: int) -> tuple[list[dict], list[dict]]:
+    """
+    Omite imágenes repetidas y pequeñas que suelen ser adornos de pie de página,
+    logos o elementos decorativos incrustados en casi todas las páginas.
+    """
+    from collections import Counter
+
+    if not images:
+        return images, []
+
+    hash_counts = Counter(_decorative_image_hash(img) for img in images)
+    decorative: list[dict] = []
+    kept: list[dict] = []
+
+    repeat_threshold = max(5, int(total_pages * 0.10))
+    very_repeat_threshold = max(8, int(total_pages * 0.30))
+
+    for img in images:
+        h = _decorative_image_hash(img)
+        repeats = hash_counts[h]
+        width = int(img.get("width") or 0)
+        height = int(img.get("height") or 0)
+        area = width * height
+        smallish = area <= 120000 or max(width, height) <= 600
+        highly_repeated = repeats >= repeat_threshold
+        overwhelmingly_repeated = repeats >= very_repeat_threshold
+
+        # Repetido en gran parte del documento y además pequeño → casi seguro adorno.
+        if smallish and (highly_repeated or overwhelmingly_repeated):
+            decorative.append(img)
+            continue
+
+        kept.append(img)
+
+    return kept, decorative
+
+
+def _find_neighbor_text_page(page_para_ranges: dict[tuple[int, int], tuple[int, int]],
+                             ch_idx: int,
+                             pg_idx: int,
+                             direction: int,
+                             limit: int = 3) -> tuple[int, tuple[int, int]] | None:
+    step = 1 if direction > 0 else -1
+    cur = pg_idx + step
+    walked = 0
+    while walked < limit and cur >= 0:
+        key = (ch_idx, cur)
+        if key in page_para_ranges:
+            return cur, page_para_ranges[key]
+        cur += step
+        walked += 1
+    return None
+
+
+def build_image_sequence_xhtml(images: list[dict], lang: str, title: str) -> str:
+    body_parts = []
+    for img in images:
+        caption_html = f'\n<p class="centrado"><i>{escape_xml(img.get("caption", ""))}</i></p>' if img.get("caption") else ""
+        body_parts.append(
+            f'<div class="dimg fullblock">\n'
+            f'  <img alt="ilustración" src="../Images/{img["name"]}"/>\n'
+            f'</div>{caption_html}'
+        )
+    return XHTML_IMAGE_SEQUENCE_TEMPLATE.format(lang=lang, title=title, body="\n".join(body_parts))
+
+
+
 def extract_pdf_content(pdf_path: str) -> tuple[list[str], list[dict]]:
     """
     Extrae texto e imágenes del PDF página por página.
@@ -579,10 +676,17 @@ def extract_pdf_content(pdf_path: str) -> tuple[list[str], list[dict]]:
             except Exception as ex:
                 print(f"  [Imágenes] ⚠️  No se pudo extraer imagen en pág {page_idx+1}: {ex}")
 
-    print(f"  [Imágenes] Extraídas: {len(images)} "
-          f"({sum(1 for i in images if i['is_full_page'])} pág. completa, "
-          f"{sum(1 for i in images if not i['is_full_page'])} inline)")
-    return pages_text, images
+    filtered_images, decorative_images = _filter_decorative_images(images, total)
+    if decorative_images:
+        decorative_pages = sorted({img["page_idx"] + 1 for img in decorative_images})
+        preview = ", ".join(map(str, decorative_pages[:8]))
+        extra = "" if len(decorative_pages) <= 8 else "…"
+        print(f"  [Imágenes] Decorativas omitidas: {len(decorative_images)} (págs {preview}{extra})")
+
+    print(f"  [Imágenes] Extraídas: {len(filtered_images)} "
+          f"({sum(1 for i in filtered_images if i['is_full_page'])} pág. completa, "
+          f"{sum(1 for i in filtered_images if not i['is_full_page'])} inline)")
+    return pages_text, filtered_images
 
 
 # Compatibilidad con código que llame a extract_pdf_text directamente
@@ -1182,14 +1286,16 @@ def para_to_html(para: str, first_in_chapter: bool = False) -> str:
     return f'<p{css_class}>{para}</p>'
 
 
-def inline_image_html(imgname: str, caption: str = "") -> str:
-    """Genera el HTML para una imagen inline dentro de un capítulo."""
+def inline_image_html(imgname: str, caption: str = "", layout: str = "inline") -> str:
+    """Genera el HTML para una imagen dentro del flujo de un capítulo."""
     cap_html = f'\n<p class="centrado"><i>{escape_xml(caption)}</i></p>' if caption else ""
+    extra_class = " fullblock" if layout == "fullblock" else ""
     return (
-        f'<div class="dimg">\n'
+        f'<div class="dimg{extra_class}">\n'
         f'  <img alt="ilustración" src="../Images/{imgname}"/>\n'
         f'</div>{cap_html}'
     )
+
 
 
 def chapter_to_xhtml(chapter: dict, lang: str = "es") -> str:
@@ -1206,7 +1312,8 @@ def chapter_to_xhtml(chapter: dict, lang: str = "es") -> str:
 
 def chapter_fragment_to_xhtml(chapter: dict, start_idx: int, end_idx: int,
                               lang: str = "es", include_header: bool = True,
-                              first_text_para_global: bool = True) -> str:
+                              first_text_para_global: bool = True,
+                              suppress_images: set[str] | None = None) -> str:
     """
     Convierte un fragmento de capítulo a XHTML para poder intercalar imágenes
     de página completa exactamente donde aparecen en el PDF.
@@ -1223,8 +1330,13 @@ def chapter_fragment_to_xhtml(chapter: dict, start_idx: int, end_idx: int,
         else:
             body_parts.append(f'<h1>{escape_xml(title)}</h1>')
 
+    suppress_images = suppress_images or set()
     img_by_pos: dict[int, list] = {}
+    seen_img_names: set[str] = set()
     for img in inline_images:
+        imgname = img.get("imgname", "")
+        if not imgname or imgname in seen_img_names or imgname in suppress_images:
+            continue
         pos = img.get("after_para_idx", -1)
         if pos < start_idx - 1 or pos >= end_idx:
             continue
@@ -1232,9 +1344,10 @@ def chapter_fragment_to_xhtml(chapter: dict, start_idx: int, end_idx: int,
         img_copy = dict(img)
         img_copy["after_para_idx"] = rebased
         img_by_pos.setdefault(rebased, []).append(img_copy)
+        seen_img_names.add(imgname)
 
     for img in img_by_pos.get(-1, []):
-        body_parts.append(inline_image_html(img["imgname"], img.get("caption", "")))
+        body_parts.append(inline_image_html(img["imgname"], img.get("caption", ""), img.get("layout", "inline")))
 
     first_text_para = first_text_para_global
     for i, para in enumerate(paragraphs):
@@ -1242,7 +1355,7 @@ def chapter_fragment_to_xhtml(chapter: dict, start_idx: int, end_idx: int,
             body_parts.append(para_to_html(para, first_in_chapter=first_text_para))
             first_text_para = False
         for img in img_by_pos.get(i, []):
-            body_parts.append(inline_image_html(img["imgname"], img.get("caption", "")))
+            body_parts.append(inline_image_html(img["imgname"], img.get("caption", ""), img.get("layout", "inline")))
 
     body_html = "\n".join(body_parts)
 
@@ -1418,6 +1531,163 @@ def resolve_cover_image(cover_image_path: str | None = None,
     return None, "none", None
 
 
+
+
+def _build_sequential_page_para_ranges(chapters: list[dict], pages_paragraphs: list[list[str]], page_to_chapter: list[int]) -> dict[tuple[int, int], tuple[int, int]]:
+    """Mapea páginas a rangos de párrafos secuenciales dentro de cada capítulo.
+    Evita que párrafos repetidos se asignen siempre a su primera aparición."""
+    n_pages = len(pages_paragraphs)
+    chapter_pages: dict[int, list[int]] = {}
+    for pg_idx in range(n_pages):
+        ch_idx = page_to_chapter[pg_idx] if pg_idx < len(page_to_chapter) else -1
+        if ch_idx >= 0:
+            chapter_pages.setdefault(ch_idx, []).append(pg_idx)
+
+    ranges: dict[tuple[int, int], tuple[int, int]] = {}
+    for ch_idx, page_indices in chapter_pages.items():
+        chapter_paras = [p.strip() for p in chapters[ch_idx].get("paragraphs", []) if p and p.strip()]
+        if not chapter_paras:
+            continue
+
+        positions_by_key: dict[str, list[int]] = {}
+        for pos, para in enumerate(chapter_paras):
+            positions_by_key.setdefault(para, []).append(pos)
+
+        cursor = 0
+        for pg_idx in page_indices:
+            visible = [p.strip() for p in pages_paragraphs[pg_idx] if p and p.strip()]
+            if not visible:
+                continue
+
+            matched_positions: list[int] = []
+            local_cursor = cursor
+            for para in visible:
+                candidates = positions_by_key.get(para)
+                if not candidates:
+                    continue
+                chosen = next((pos for pos in candidates if pos >= local_cursor), None)
+                if chosen is None:
+                    continue
+                matched_positions.append(chosen)
+                local_cursor = chosen + 1
+
+            if matched_positions:
+                start = matched_positions[0]
+                end = matched_positions[-1] + 1
+                ranges[(ch_idx, pg_idx)] = (start, end)
+                cursor = max(cursor, end)
+
+    return ranges
+
+
+def _fragment_first_text(chapters: list[dict], item: dict) -> str:
+    if item.get("type") != "chapter_fragment":
+        return ""
+    ch_idx = item.get("ch_idx", -1)
+    if ch_idx < 0 or ch_idx >= len(chapters):
+        return ""
+    paras = chapters[ch_idx].get("paragraphs", [])
+    start = max(0, int(item.get("start_idx", 0)))
+    end = min(len(paras), int(item.get("end_idx", 0)))
+    for para in paras[start:end]:
+        key = (para or "").strip()
+        if key:
+            return key
+    return ""
+
+
+def _fragment_image_names(chapters: list[dict], item: dict) -> set[str]:
+    if item.get("type") != "chapter_fragment":
+        return set()
+    ch_idx = item.get("ch_idx", -1)
+    if ch_idx < 0 or ch_idx >= len(chapters):
+        return set()
+    start_idx = int(item.get("start_idx", 0))
+    end_idx = int(item.get("end_idx", 0))
+    names: set[str] = set()
+    for img in chapters[ch_idx].get("inline_images", []):
+        name = img.get("imgname", "")
+        if not name:
+            continue
+        pos = int(img.get("after_para_idx", -1))
+        if start_idx - 1 <= pos < end_idx:
+            names.add(name)
+    return names
+
+
+def _normalize_spine_fragments(spine_items: list[dict], chapters: list[dict]) -> tuple[list[dict], list[str]]:
+    normalized: list[dict] = []
+    issues: list[str] = []
+    last_end_by_chapter: dict[int, int] = {}
+    prev_fragment: dict | None = None
+
+    for item in spine_items:
+        if item.get("type") != "chapter_fragment":
+            normalized.append(item)
+            prev_fragment = None
+            continue
+
+        cur = dict(item)
+        ch_idx = int(cur.get("ch_idx", -1))
+        start = int(cur.get("start_idx", 0))
+        end = int(cur.get("end_idx", 0))
+
+        last_end = last_end_by_chapter.get(ch_idx)
+        if last_end is not None and start < last_end:
+            issues.append(f"overlap_trim ch={ch_idx} {start}->{end} trimmed_to {last_end}->{end}")
+            start = last_end
+            cur["start_idx"] = start
+        if end <= start:
+            issues.append(f"empty_drop ch={ch_idx} {start}->{end}")
+            continue
+
+        if prev_fragment and prev_fragment.get("type") == "chapter_fragment" and prev_fragment.get("ch_idx") == ch_idx:
+            prev_first = _fragment_first_text(chapters, prev_fragment)
+            cur_first = _fragment_first_text(chapters, cur)
+            if prev_first and cur_first and prev_first == cur_first:
+                prev_end = int(prev_fragment.get("end_idx", 0))
+                if start < prev_end:
+                    start = prev_end
+                    cur["start_idx"] = start
+                    issues.append(f"same_start_trim ch={ch_idx} -> {start}->{end}")
+            shared_images = _fragment_image_names(chapters, prev_fragment) & _fragment_image_names(chapters, cur)
+            if shared_images:
+                suppress = set(cur.get("suppress_images", []))
+                suppress.update(shared_images)
+                cur["suppress_images"] = sorted(suppress)
+                issues.append(f"shared_images_suppressed ch={ch_idx} imgs={','.join(sorted(shared_images))}")
+            if int(cur.get("end_idx", 0)) <= int(cur.get("start_idx", 0)):
+                issues.append(f"post_check_drop ch={ch_idx} {cur.get('start_idx')}->{cur.get('end_idx')}")
+                continue
+
+        normalized.append(cur)
+        last_end_by_chapter[ch_idx] = int(cur.get("end_idx", 0))
+        prev_fragment = cur
+
+    return normalized, issues
+
+
+def _validate_spine_fragments(spine_items: list[dict], chapters: list[dict]) -> list[str]:
+    issues: list[str] = []
+    prev_fragment: dict | None = None
+    for item in spine_items:
+        if item.get("type") != "chapter_fragment":
+            prev_fragment = None
+            continue
+        if prev_fragment and prev_fragment.get("type") == "chapter_fragment" and prev_fragment.get("ch_idx") == item.get("ch_idx"):
+            if int(item.get("start_idx", 0)) < int(prev_fragment.get("end_idx", 0)):
+                issues.append(f"overlap ch={item.get('ch_idx')} {prev_fragment.get('start_idx')}->{prev_fragment.get('end_idx')} with {item.get('start_idx')}->{item.get('end_idx')}")
+            prev_first = _fragment_first_text(chapters, prev_fragment)
+            cur_first = _fragment_first_text(chapters, item)
+            if prev_first and cur_first and prev_first == cur_first:
+                issues.append(f"same_start_text ch={item.get('ch_idx')} text={prev_first[:80]}")
+            shared_images = _fragment_image_names(chapters, prev_fragment) & _fragment_image_names(chapters, item)
+            shared_images -= set(item.get("suppress_images", []))
+            if shared_images:
+                issues.append(f"shared_images ch={item.get('ch_idx')} imgs={','.join(sorted(shared_images))}")
+        prev_fragment = item
+    return issues
+
 def create_epub(chapters: list[dict], meta: dict, output_path: str,
                 cover_image_path: str | None = None,
                 images: list[dict] | None = None,
@@ -1425,19 +1695,18 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
                 pages_paragraphs: list[list[str]] | None = None,
                 page_to_chapter: list | None = None) -> None:
     """
-    Genera el archivo EPUB final.
-
-    La corrección importante aquí es que el spine se construye como una
-    secuencia de fragmentos de capítulo e imágenes siguiendo el orden real de
-    las páginas del PDF. Antes, cada capítulo se emitía completo la primera vez
-    que aparecía; si luego había una ilustración a mitad del capítulo, esa
-    imagen terminaba después de TODO el capítulo en el EPUB.
+    Genera el archivo EPUB final siguiendo el orden real de las páginas del PDF,
+    pero evitando desperdiciar espacio cuando hay ilustraciones o secuencias
+    visuales. Las imágenes decorativas repetidas ya se filtran antes, y aquí:
+      - las ilustraciones entre texto se integran dentro del flujo del capítulo
+      - las imágenes de páginas consecutivas sin texto se agrupan en una galería
+      - la portada automática no se duplica como página normal
     """
-    lang  = meta.get("lang", "es")
-    images           = images           or []
-    raw_pages        = raw_pages        or []
+    lang = meta.get("lang", "es")
+    images = images or []
+    raw_pages = raw_pages or []
     pages_paragraphs = pages_paragraphs or []
-    n_pages          = len(raw_pages)
+    n_pages = len(raw_pages)
 
     excluded_pages = set(meta.get('excluded_pages', []) or [])
     full_page_img_map: dict[int, list] = {}
@@ -1460,29 +1729,9 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
     for ch in chapters:
         ch.setdefault("inline_images", [])
 
-    para_index: dict[tuple[int, str], int] = {}
-    for ci, ch in enumerate(chapters):
-        for pi, para in enumerate(ch.get("paragraphs", [])):
-            key = para.strip()
-            if key and (ci, key) not in para_index:
-                para_index[(ci, key)] = pi
+    page_para_ranges = _build_sequential_page_para_ranges(chapters, pages_paragraphs, page_to_chapter)
 
-    page_para_ranges: dict[tuple[int, int], tuple[int, int]] = {}
-    for pg_idx, page_paras in enumerate(pages_paragraphs):
-        ch_idx = page_to_chapter[pg_idx] if pg_idx < len(page_to_chapter) else -1
-        if ch_idx < 0 or ch_idx >= len(chapters):
-            continue
-        positions = []
-        for para in page_paras:
-            key = para.strip()
-            if not key:
-                continue
-            pos = para_index.get((ch_idx, key))
-            if pos is not None:
-                positions.append(pos)
-        if positions:
-            page_para_ranges[(ch_idx, pg_idx)] = (min(positions), max(positions) + 1)
-
+    # Imágenes inline normales: ancladas al final del rango textual de la página.
     for pg_idx, page_imgs in inline_imgs_by_page.items():
         ch_idx = page_to_chapter[pg_idx] if pg_idx < len(page_to_chapter) else -1
         if ch_idx < 0 or ch_idx >= len(chapters):
@@ -1498,7 +1747,41 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
                 "after_para_idx": after_idx,
                 "imgname": iimg["name"],
                 "caption": iimg.get("caption", ""),
+                "layout": "inline",
             })
+
+    # Imágenes de página completa dentro del cuerpo narrativo:
+    # si están entre páginas del mismo capítulo, las integramos en el XHTML del
+    # capítulo en vez de emitir una página EPUB aparte.
+    consumed_full_pages: set[int] = set()
+    for pg_idx, page_imgs in full_page_img_map.items():
+        if pg_idx in excluded_pages:
+            continue
+        if cover_page_idx is not None and pg_idx == cover_page_idx:
+            continue
+        ch_idx = page_to_chapter[pg_idx] if pg_idx < len(page_to_chapter) else -1
+        if ch_idx < 0 or ch_idx >= len(chapters):
+            continue
+
+        prev_info = _find_neighbor_text_page(page_para_ranges, ch_idx, pg_idx, -1, limit=2)
+        next_info = _find_neighbor_text_page(page_para_ranges, ch_idx, pg_idx, +1, limit=2)
+        if prev_info is None and next_info is None:
+            continue
+
+        if prev_info is not None:
+            _, (_, prev_end_idx) = prev_info
+            after_idx = prev_end_idx - 1
+        else:
+            after_idx = -1
+
+        for fimg in page_imgs:
+            chapters[ch_idx]["inline_images"].append({
+                "after_para_idx": after_idx,
+                "imgname": fimg["name"],
+                "caption": fimg.get("caption", ""),
+                "layout": "fullblock",
+            })
+        consumed_full_pages.add(pg_idx)
 
     for ch in chapters:
         ch["inline_images"].sort(key=lambda x: (x.get("after_para_idx", -1), x.get("imgname", "")))
@@ -1506,7 +1789,6 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
     spine_items: list[dict] = []
     nav_points: list[dict] = [{"label": "Portada", "src": "Text/Portada.xhtml"}]
     chapter_nav_added: set[int] = set()
-
     current_segment: dict | None = None
 
     def flush_segment():
@@ -1515,11 +1797,18 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
             spine_items.append(dict(current_segment))
         current_segment = None
 
-    for pg_idx in range(n_pages):
+    pg_idx = 0
+    while pg_idx < n_pages:
         if pg_idx in excluded_pages:
+            pg_idx += 1
             continue
         if cover_page_idx is not None and pg_idx == cover_page_idx:
+            pg_idx += 1
             continue
+        if pg_idx in consumed_full_pages:
+            pg_idx += 1
+            continue
+
         ch_idx = page_to_chapter[pg_idx] if pg_idx < len(page_to_chapter) else -1
         page_range = page_para_ranges.get((ch_idx, pg_idx)) if ch_idx >= 0 else None
 
@@ -1533,7 +1822,7 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
                     "end_idx": end_idx,
                     "include_header": ch_idx not in chapter_nav_added,
                 }
-            elif current_segment["ch_idx"] == ch_idx and current_segment["end_idx"] == start_idx and pg_idx not in full_page_img_map:
+            elif current_segment["ch_idx"] == ch_idx and current_segment["end_idx"] == start_idx:
                 current_segment["end_idx"] = end_idx
             else:
                 flush_segment()
@@ -1544,24 +1833,34 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
                     "end_idx": end_idx,
                     "include_header": ch_idx not in chapter_nav_added,
                 }
+            if ch_idx >= 0:
+                chapter_nav_added.add(ch_idx)
+            pg_idx += 1
+            continue
 
         if pg_idx in full_page_img_map:
             flush_segment()
-            for img in full_page_img_map[pg_idx]:
-                spine_items.append({"type": "img_page", "img": img})
+            seq = []
+            scan = pg_idx
+            while scan < n_pages:
+                if scan in excluded_pages or scan in consumed_full_pages:
+                    break
+                if cover_page_idx is not None and scan == cover_page_idx:
+                    break
+                scan_ch = page_to_chapter[scan] if scan < len(page_to_chapter) else -1
+                scan_range = page_para_ranges.get((scan_ch, scan)) if scan_ch >= 0 else None
+                if scan_range is not None:
+                    break
+                if scan not in full_page_img_map:
+                    break
+                seq.extend(full_page_img_map[scan])
+                scan += 1
+            if seq:
+                spine_items.append({"type": "img_sequence", "images": seq})
+                pg_idx = scan
+                continue
 
-        if page_range and current_segment is None:
-            start_idx, end_idx = page_range
-            current_segment = {
-                "type": "chapter_fragment",
-                "ch_idx": ch_idx,
-                "start_idx": start_idx,
-                "end_idx": end_idx,
-                "include_header": ch_idx not in chapter_nav_added,
-            }
-
-        if page_range and ch_idx >= 0:
-            chapter_nav_added.add(ch_idx)
+        pg_idx += 1
 
     flush_segment()
 
@@ -1578,10 +1877,30 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
         else:
             emitted_covering[ch_idx] = (min(prev[0], start_idx), max(prev[1], end_idx))
 
+    chapter_ranges: dict[int, list[tuple[int, int]]] = {}
+    for item in spine_items:
+        if item["type"] != "chapter_fragment":
+            continue
+        chapter_ranges.setdefault(item["ch_idx"], []).append((item["start_idx"], item["end_idx"]))
+
+    def _merged_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        cleaned = sorted((s, e) for s, e in ranges if e >= s)
+        if not cleaned:
+            return []
+        merged = [cleaned[0]]
+        for start, end in cleaned[1:]:
+            last_start, last_end = merged[-1]
+            if start <= last_end:
+                merged[-1] = (last_start, max(last_end, end))
+            else:
+                merged.append((start, end))
+        return merged
+
     for ch_idx, ch in enumerate(chapters):
         total = len(ch.get("paragraphs", []))
-        covered = emitted_covering.get(ch_idx)
-        if total == 0 and covered is None:
+        ranges = _merged_ranges(chapter_ranges.get(ch_idx, []))
+
+        if total == 0 and not ranges:
             spine_items.append({
                 "type": "chapter_fragment",
                 "ch_idx": ch_idx,
@@ -1589,26 +1908,62 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
                 "end_idx": 0,
                 "include_header": ch_idx not in chapter_nav_added,
             })
-        elif covered is None:
-            spine_items.append({
-                "type": "chapter_fragment",
-                "ch_idx": ch_idx,
-                "start_idx": 0,
-                "end_idx": total,
-                "include_header": ch_idx not in chapter_nav_added,
-            })
-        elif covered[0] > 0 or covered[1] < total:
-            spine_items.append({
-                "type": "chapter_fragment",
-                "ch_idx": ch_idx,
-                "start_idx": 0,
-                "end_idx": total,
-                "include_header": ch_idx not in chapter_nav_added,
-            })
+            continue
 
-    full_img_count   = sum(1 for s in spine_items if s["type"] == "img_page")
+        if not ranges:
+            spine_items.append({
+                "type": "chapter_fragment",
+                "ch_idx": ch_idx,
+                "start_idx": 0,
+                "end_idx": total,
+                "include_header": ch_idx not in chapter_nav_added,
+            })
+            continue
+
+        cursor = 0
+        for start, end in ranges:
+            if cursor < start:
+                spine_items.append({
+                    "type": "chapter_fragment",
+                    "ch_idx": ch_idx,
+                    "start_idx": cursor,
+                    "end_idx": start,
+                    "include_header": ch_idx not in chapter_nav_added and cursor == 0,
+                })
+                if cursor == 0:
+                    chapter_nav_added.add(ch_idx)
+            cursor = max(cursor, end)
+
+        if cursor < total:
+            spine_items.append({
+                "type": "chapter_fragment",
+                "ch_idx": ch_idx,
+                "start_idx": cursor,
+                "end_idx": total,
+                "include_header": ch_idx not in chapter_nav_added and cursor == 0,
+            })
+            if cursor == 0:
+                chapter_nav_added.add(ch_idx)
+
+    spine_items, normalization_issues = _normalize_spine_fragments(spine_items, chapters)
+    for issue in normalization_issues[:12]:
+        print(f"  [EPUB] Ajuste fragmentos: {issue}")
+    if len(normalization_issues) > 12:
+        print(f"  [EPUB] Ajuste fragmentos: ... y {len(normalization_issues)-12} más")
+
+    validation_issues = _validate_spine_fragments(spine_items, chapters)
+    if validation_issues:
+        print("  [EPUB] ⚠️ Validación de fragmentos detectó problemas residuales:")
+        for issue in validation_issues[:12]:
+            print(f"    - {issue}")
+        if len(validation_issues) > 12:
+            print(f"    ... y {len(validation_issues)-12} más")
+    else:
+        print("  [EPUB] Validación de fragmentos: sin solapamientos sospechosos")
+
+    sequence_count = sum(1 for s in spine_items if s["type"] == "img_sequence")
     inline_img_count = sum(len(ch.get("inline_images", [])) for ch in chapters)
-    print(f"  [EPUB] Imágenes: {full_img_count} pág. completa, {inline_img_count} inline")
+    print(f"  [EPUB] Imágenes: {sequence_count} secuencia(s) visual(es), {inline_img_count} integradas en texto")
 
     book_uuid = str(uuid.uuid4())
 
@@ -1634,7 +1989,7 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
             zf.writestr(f"OEBPS/Images/{img['name']}", img["data"])
 
         manifest_items: list[dict] = []
-        spine_idrefs:   list[str]  = []
+        spine_idrefs: list[str] = []
 
         manifest_items.append({"id": "Portada", "href": "Text/Portada.xhtml",
                                "media_type": "application/xhtml+xml"})
@@ -1646,24 +2001,24 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
 
         for img in images:
             manifest_items.append({
-                "id":         f"img-{img['name'].replace('.', '-')}",
-                "href":       f"Images/{img['name']}",
+                "id": f"img-{img['name'].replace('.', '-')}",
+                "href": f"Images/{img['name']}",
                 "media_type": img["media_type"],
             })
 
-        img_page_counter = 0
+        visual_counter = 0
         text_counter = 0
         chapter_nav_written: set[int] = set()
 
         for item in spine_items:
-            if item["type"] == "img_page":
-                img_page_counter += 1
-                ip_filename = f"img_page_{img_page_counter:03d}.xhtml"
-                ip_id       = f"imgpage{img_page_counter:03d}"
+            if item["type"] == "img_sequence":
+                visual_counter += 1
+                ip_filename = f"img_seq_{visual_counter:03d}.xhtml"
+                ip_id = f"imgseq{visual_counter:03d}"
+                title = f"Ilustraciones {visual_counter}"
                 zf.writestr(
                     f"OEBPS/Text/{ip_filename}",
-                    build_image_page_xhtml(item["img"], lang,
-                                           f"Ilustración {img_page_counter}"),
+                    build_image_sequence_xhtml(item["images"], lang, title),
                 )
                 manifest_items.append({"id": ip_id, "href": f"Text/{ip_filename}",
                                        "media_type": "application/xhtml+xml"})

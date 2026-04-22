@@ -1,0 +1,49 @@
+
+=======================================================
+  PDF → EPUB Converter  |  Perfil: Apotecaria
+=======================================================
+  Entrada : /mnt/data/CoTE_Vol 0_Reversi_Blog.pdf
+  Salida  : /tmp/pdf2epubfix3/test_fixed.epub
+  Título  : CoTE_Vol 0_Reversi_Blog
+  Autor   : HP
+
+▶ FASE 1 — Extrayendo texto e imágenes del PDF...
+  [PDF] Extraídas 325 páginas con pdfminer.
+  [PDF] Encabezados/pies eliminados: ['Youkoso Jitsuryoku Shijou Shugi No Kyoushitsu E', 'Youkoso Jitsuryoku Shijou Shugi No Kyoushitsu E \nVolumen 0 – [Reversi Blog]']
+  [Imágenes] Decorativas omitidas: 325 (págs 1, 2, 3, 4, 5, 6, 7, 8…)
+  [Imágenes] Extraídas: 19 (18 pág. completa, 1 inline)
+
+▶ FASE 1.5 — Evaluando OCR...
+  OCR: desactivado
+
+▶ FASE 2 — Limpiando texto...
+
+▶ FASE 3 — Detectando capítulos...
+  [Capítulos] Detectados: 10
+  [Estructura] TOC excluido en páginas: 7
+  [Estructura] Front matter visual antes del cuerpo: 1, 2, 3, 4, 5
+    - [prologue] Prólogo: Monólogo de Atsuomi Ayanokouji (pág PDF 9)
+    - [chapter] Capítulo 1: Lanzamiento del Proyecto (pág PDF 16)
+    - [chapter] Capítulo 2: Haciendo Todo Lo Posible (pág PDF 45)
+    - [chapter] Capítulo 3: Fase Inicial (pág PDF 116)
+    - [chapter] Capítulo 4: Una Instalación Experimental Sin Precede (pág PDF 144)
+    - [chapter] Capítulo 5: Historias De Niños Inocentes (pág PDF 161)
+    - [chapter] Capítulo 6: La Desesperanza Y Un Modo De Vida (pág PDF 245)
+    - [epilogue] Epílogo: De Cara Al Futuro (pág PDF 296)
+    ... y 2 más
+  [Diálogos] Sistema detectado: none {'guion': 43, 'guion2': 0, 'comillas': 1, 'none': 138}
+
+▶ FASE 4 — Generando EPUB...
+  [EPUB] Mapa página→capítulo: 317/325 páginas mapeadas
+  [EPUB] Validación de fragmentos: sin solapamientos sospechosos
+  [EPUB] Imágenes: 1 secuencia(s) visual(es), 12 integradas en texto
+  [EPUB] Portada: auto:página 1
+
+  ✅ EPUB generado: /tmp/pdf2epubfix3/test_fixed.epub
+     Tamaño: 5629.4 KB | Capítulos: 10 | Imágenes: 19
+
+=======================================================
+  ✅ Conversión completada exitosamente
+  📖 /tmp/pdf2epubfix3/test_fixed.epub
+=======================================================
+
