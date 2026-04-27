@@ -701,20 +701,74 @@ def extract_pdf_text(pdf_path: str) -> list[str]:
 
 # Patrones de encabezados/pies repetidos (se detectan dinámicamente)
 HEADER_FOOTER_MIN_REPEAT = 4  # aparece en al menos N páginas = candidato a header/footer
+VARIABLE_PAGE_LINE_RE = re.compile(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9 .:'’_\-]{3,80}\s*\|\s*\d{1,4}$")
+STRUCTURAL_HEADING_RE = re.compile(
+    r'^(?:cap[ií]tulo(?:\s+\d+)?|parte(?:\s+\d+)?|pr[oó]logo|ep[ií]logo|afterword|agradecimientos?)\b',
+    re.IGNORECASE,
+)
 
-def detect_repeated_lines(pages: list[str]) -> set[str]:
-    """Detecta líneas que se repiten en muchas páginas (encabezados/pies residuales)."""
+
+def normalize_header_footer_candidate(line: str) -> str:
+    """Normaliza líneas candidatas a header/footer con número de página variable."""
+    s = re.sub(r'\s+', ' ', (line or '').strip())
+    if not s:
+        return ''
+    if STRUCTURAL_HEADING_RE.match(s):
+        return ''
+
+    # Número de página suelto o rodeado por adornos: — 15 — / - 15 - / 15
+    if re.fullmatch(r'[\-–—\s]*\d{1,4}[\-–—\s]*', s):
+        return '<PAGE_NUM>'
+
+    # Página 15 / Pag. 15 / pág. 15
+    s = re.sub(r'\b(P[áa]g(?:ina)?\.?\s*)\d{1,4}\b', r'\1<PAGE_NUM>', s, flags=re.IGNORECASE)
+
+    # Texto fijo | número
+    if VARIABLE_PAGE_LINE_RE.fullmatch(s):
+        s = re.sub(r'\d{1,4}\s*$', '<PAGE_NUM>', s)
+
+    # Caso decorado puro una vez sustituido.
+    if re.fullmatch(r'[\-–—\s]*<PAGE_NUM>[\-–—\s]*', s):
+        return '<PAGE_NUM>'
+
+    # Otras líneas con número variable conservando el texto fijo.
+    s = re.sub(r'(?<!\w)\d{1,4}(?!\w)', '<PAGE_NUM>', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+
+    if STRUCTURAL_HEADING_RE.match(s):
+        return ''
+    return s
+
+
+def detect_repeated_lines(pages: list[str]) -> tuple[set[str], set[str]]:
+    """Detecta líneas repetidas exactas y líneas repetidas tras normalización."""
     from collections import Counter
-    line_count: Counter = Counter()
+
+    exact_count: Counter = Counter()
+    normalized_count: Counter = Counter()
+
     for page_text in pages:
         lines = page_text.strip().splitlines()
         candidates = lines[:3] + lines[-3:] if len(lines) >= 6 else lines
+        seen_exact: set[str] = set()
+        seen_normalized: set[str] = set()
         for line in candidates:
-            line = line.strip()
-            if line and len(line) > 2:
-                line_count[line] += 1
-    return {line for line, count in line_count.items()
-            if count >= HEADER_FOOTER_MIN_REPEAT}
+            stripped = re.sub(r'\s+', ' ', line.strip())
+            if not stripped or len(stripped) <= 2:
+                continue
+            if STRUCTURAL_HEADING_RE.match(stripped):
+                continue
+            if stripped not in seen_exact:
+                exact_count[stripped] += 1
+                seen_exact.add(stripped)
+            normalized = normalize_header_footer_candidate(stripped)
+            if normalized and normalized not in seen_normalized:
+                normalized_count[normalized] += 1
+                seen_normalized.add(normalized)
+
+    repeated_exact = {line for line, count in exact_count.items() if count >= HEADER_FOOTER_MIN_REPEAT}
+    repeated_normalized = {line for line, count in normalized_count.items() if count >= HEADER_FOOTER_MIN_REPEAT}
+    return repeated_exact, repeated_normalized
 
 
 def clean_text(raw_pages: list[str], config: dict) -> str:
@@ -739,38 +793,59 @@ def clean_text_per_page(raw_pages: list[str], config: dict) -> list[list[str]]:
     Esto preserva a qué página pertenece cada párrafo, lo que permite
     construir un mapa página→capítulo exacto en create_epub.
     """
-    repeated_lines = detect_repeated_lines(raw_pages)
-    if repeated_lines and config.get("verbose"):
-        print(f"  [Limpieza] Líneas repetidas residuales ({len(repeated_lines)}):")
-        for l in list(repeated_lines)[:5]:
-            print(f"    - {repr(l)}")
+    repeated_lines, repeated_normalized = detect_repeated_lines(raw_pages)
+    if config.get("verbose"):
+        if repeated_lines:
+            print(f"  [Limpieza] Líneas repetidas residuales exactas ({len(repeated_lines)}):")
+            for l in list(sorted(repeated_lines))[:5]:
+                print(f"    - {repr(l)}")
+        if repeated_normalized:
+            print(f"  [Limpieza] Patrones repetidos normalizados ({len(repeated_normalized)}):")
+            for l in list(sorted(repeated_normalized))[:5]:
+                print(f"    - {repr(l)}")
 
     HF_EXTRA_PATTERNS = [
         re.compile(r'P[áa]gina\s+N[°º]?\s*\d+', re.IGNORECASE),
         re.compile(r'\bpág(?:ina)?\s*\.?\s*\d+', re.IGNORECASE),
         re.compile(r'^[\-–—]\s*\d+\s*[\-–—]$'),
+        VARIABLE_PAGE_LINE_RE,
     ]
 
+    verbose_removed = 0
     result: list[list[str]] = []
-    for page_text in raw_pages:
+    for page_idx, page_text in enumerate(raw_pages):
         page_lines: list[str] = []
         for line in page_text.splitlines():
-            stripped = line.strip()
+            stripped = re.sub(r'\s+', ' ', line.strip())
             if not stripped:
                 page_lines.append("")
                 continue
+
+            normalized = normalize_header_footer_candidate(stripped)
+            should_remove = False
             if stripped in repeated_lines:
-                continue
-            if re.fullmatch(r'\d{1,4}', stripped):
-                continue
-            if any(p.search(stripped) for p in HF_EXTRA_PATTERNS):
+                should_remove = True
+            elif normalized and normalized in repeated_normalized:
+                should_remove = True
+            elif re.fullmatch(r'\d{1,4}', stripped):
+                should_remove = True
+            elif any(p.search(stripped) for p in HF_EXTRA_PATTERNS):
+                should_remove = True
+
+            # No eliminar headings narrativos legítimos.
+            if should_remove and STRUCTURAL_HEADING_RE.match(stripped):
+                should_remove = False
+
+            if should_remove:
+                if config.get("verbose") and verbose_removed < 10:
+                    print(f"  [Limpieza] Header/footer residual eliminado p.{page_idx + 1}: {repr(stripped)}")
+                    verbose_removed += 1
                 continue
             page_lines.append(stripped)
         paragraphs = reconstruct_paragraphs(page_lines, config)
         result.append(paragraphs)
 
     return result
-
 
 def reconstruct_paragraphs(lines: list[str], config: dict) -> list[str]:
     """
