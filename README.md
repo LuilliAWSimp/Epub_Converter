@@ -1,114 +1,126 @@
-# PDF → EPUB Converter v2 con OCR
+# PDF → EPUB Converter (Local Web Tool)
 
-Proyecto local para convertir PDF a EPUB con dos rutas de extracción:
+Herramienta local para convertir PDF a EPUB con interfaz web, enfocada
+en libros narrativos (especialmente novelas ligeras e ilustradas).
 
-- extracción normal para PDFs con texto real
-- OCR opcional para páginas escaneadas o con texto corrupto
+A diferencia de convertidores simples, este proyecto intenta
+**reconstruir la estructura lógica del libro**, no solo extraer texto.
 
-## Contenido
+------------------------------------------------------------------------
 
-- `pdf2epub.py`: motor principal PDF → EPUB.
-- `gui.py`: interfaz web local.
-- `requirements.txt`: dependencias Python.
-- `run_gui.bat`: arranca la GUI.
-- `run_cli_example.bat`: ejemplo CLI.
+## ✨ Características
 
-## Requisitos
+-   Interfaz web local (no depende de servicios externos)
+-   Conversión PDF → EPUB optimizada para lectura
+-   Detección automática de:
+    -   Prólogo
+    -   Capítulos
+    -   Epílogo
+    -   Afterword
+    -   Historias extra
+-   Preserva:
+    -   estructura narrativa
+    -   títulos y subtítulos de capítulos
+    -   flujo del contenido
+-   Manejo de imágenes:
+    -   conserva ilustraciones relevantes
+    -   elimina imágenes decorativas repetidas
+-   OCR opcional para PDFs escaneados o con texto corrupto
 
-- Python 3.11 o superior recomendado.
-- Windows, Linux o macOS.
-- **Tesseract OCR** instalado si quieres usar OCR.
+------------------------------------------------------------------------
 
-## Instalar dependencias Python
+## 🧠 Enfoque del proyecto
 
-```bash
-python -m venv .venv
-```
+Este convertidor no busca solo "sacar texto del PDF", sino:
 
-### Windows
+-   evitar que la tabla de contenido se trate como texto real
+-   separar correctamente capítulos
+-   conservar títulos en lugar de convertirlos en párrafos normales
+-   mantener una experiencia de lectura coherente en EPUB
 
-```bash
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
+------------------------------------------------------------------------
 
-### Linux / macOS
+## 📁 Contenido del proyecto
 
-```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+-   `pdf2epub.py`: motor principal PDF → EPUB
+-   `gui.py`: interfaz web local
+-   `requirements.txt`: dependencias Python
+-   `run_gui.bat`: lanzador automático (recomendado)
+-   `run_cli_example.bat`: ejemplo por consola
 
-## Instalar Tesseract OCR
+------------------------------------------------------------------------
 
-### Windows
+## 🚀 Uso rápido (recomendado)
 
-Instala Tesseract y asegúrate de que `tesseract.exe` quede en el `PATH` del sistema.
-Si no queda en `PATH`, puedes pasar su ruta con `--tesseract-cmd`.
+1.  Ejecuta:
 
-### Linux
+run_gui.bat
 
-```bash
-sudo apt install tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng
-```
+2.  El script:
+    -   detecta Python
+    -   crea entorno virtual (si no existe)
+    -   instala dependencias automáticamente
+    -   abre la interfaz web
+3.  Usa el navegador para convertir tu PDF
 
-### macOS
+------------------------------------------------------------------------
 
-```bash
-brew install tesseract
-brew install tesseract-lang
-```
+## 🔧 Mejoras recientes (importante)
 
-## Uso por línea de comandos
+### 🖼️ Manejo de imágenes mejorado
 
-### Sin OCR
+Antes: - EPUB se veía bien en PC - En móvil podían aparecer: - imágenes
+negras - imágenes cortadas - bloques grises/negros
 
-```bash
-python pdf2epub.py "Volumen 15.pdf" -o "Volumen 15.epub"
-```
+Ahora: - Imágenes funcionan correctamente en: - móvil - escritorio -
+Eliminación de imágenes basura del PDF - Mejor compatibilidad entre
+lectores EPUB
 
-### OCR automático
+Tradeoff: - layout inicial de imágenes más controlado - menos
+"compacto", pero mucho más estable
 
-```bash
-python pdf2epub.py "u2.1 (1).pdf" -o "u2.1.epub" --ocr auto --ocr-lang spa+eng
-```
+------------------------------------------------------------------------
 
-### OCR forzado en todas las páginas
+### 🧹 Limpieza de headers/footers
 
-```bash
-python pdf2epub.py "u2.1 (1).pdf" -o "u2.1_ocr.epub" --ocr force --ocr-lang spa+eng
-```
+-   Eliminación mejorada de líneas repetidas como:
+    -   `Einherjar Project | 15`
+-   Detección por patrón (no solo coincidencia exacta)
 
-### Si `tesseract.exe` no está en PATH
+------------------------------------------------------------------------
 
-```bash
-python pdf2epub.py "u2.1 (1).pdf" -o "u2.1_ocr.epub" --ocr auto --ocr-lang spa+eng --tesseract-cmd "C:\Program Files\Tesseract-OCR\tesseract.exe"
-```
+### 📖 Mejora en títulos de capítulos
 
-## Uso con interfaz web
+-   Detecta correctamente capítulos y secciones
+-   Conserva subtítulos
+-   Evita convertirlos en texto plano
 
-```bash
-python gui.py
-```
+------------------------------------------------------------------------
 
-Luego abre en tu navegador:
+## ⚠️ Limitaciones
 
-- `http://localhost:7474`
+-   tablas complejas
+-   fórmulas
+-   PDFs tipo revista
+-   maquetación en columnas
 
-La GUI incluye:
+------------------------------------------------------------------------
 
-- selector de modo OCR: desactivado, auto o forzado
-- idiomas OCR
-- recarga de `pdf2epub.py` desde disco al convertir
+## ⚙️ Tecnologías
 
-## Qué mejora esta v2
+-   Python
+-   Flask
+-   PyMuPDF / pdfminer / pypdf
+-   Pillow
+-   Tesseract OCR
 
-- mantiene el arreglo del orden de imágenes internas
-- puede relanzar OCR solo en páginas problemáticas
-- sirve mejor para PDFs escaneados o con capa de texto muy dañada
+------------------------------------------------------------------------
 
-## Limitaciones
+## 📌 Resumen
 
-- tablas, fórmulas y diagramas pueden seguir quedando imperfectos
-- el OCR mejora mucho texto corrido, pero no “entiende” la maquetación compleja como un humano
-- para novelas y textos lineales suele dar mejores resultados que para libros técnicos
+Una herramienta local PDF → EPUB pensada para libros narrativos, que:
+
+-   reconstruye la estructura del libro
+-   limpia artefactos del PDF
+-   conserva capítulos y títulos
+-   y ahora ofrece mejor compatibilidad entre dispositivos
