@@ -3,9 +3,6 @@
 Herramienta local para convertir PDF a EPUB con interfaz web, enfocada
 en libros narrativos (especialmente novelas ligeras e ilustradas).
 
-A diferencia de convertidores simples, este proyecto intenta
-**reconstruir la estructura lógica del libro**, no solo extraer texto.
-
 ------------------------------------------------------------------------
 
 ## ✨ Características
