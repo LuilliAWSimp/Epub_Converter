@@ -92,6 +92,9 @@ h1, h2, h3, h4, h5, h6 {
 h1 { font-size: 1.6em; margin-top: 0em; }
 h1.titulo  { margin-top: 1.5em; margin-bottom: 0; }
 h2.subtitulo { margin-top: 0.5em; margin-bottom: 0; }
+h1.chapter-title { margin-top: 1.8em; margin-bottom: 0.4em; text-align: center; font-weight: bold; }
+h2.chapter-subtitle { margin-top: 0.2em; margin-bottom: 1.4em; text-align: center; font-size: 1.15em; font-weight: bold; }
+h3.part-title { margin-top: 1.4em; margin-bottom: 0.8em; text-align: center; font-size: 1.1em; font-weight: bold; }
 
 /* === ESTILOS EN LÍNEA === */
 i { font-style: italic; }
@@ -463,6 +466,64 @@ def _decorative_image_hash(img: dict) -> str:
     return hashlib.sha1(img.get("data", b"")).hexdigest()
 
 
+def _encode_image_for_epub(pil_img):
+    """Convierte cualquier imagen extraída del PDF a un formato seguro para EPUB.
+    Evita dejar JPEG2000/JPX u otros formatos internos con extensión engañosa.
+    """
+    from PIL import Image
+
+    if pil_img.mode in ("RGBA", "LA"):
+        # PNG conserva alpha y es ampliamente compatible.
+        out = pil_img.convert("RGBA")
+        fmt = "PNG"
+        ext = "png"
+        media_type = "image/png"
+    else:
+        if pil_img.mode not in ("RGB", "L"):
+            out = pil_img.convert("RGB")
+        elif pil_img.mode == "L":
+            out = pil_img.convert("RGB")
+        else:
+            out = pil_img
+        fmt = "JPEG"
+        ext = "jpg"
+        media_type = "image/jpeg"
+
+    buf = io.BytesIO()
+    save_kwargs = {"format": fmt}
+    if fmt == "JPEG":
+        save_kwargs.update({"quality": 95, "optimize": True})
+    else:
+        save_kwargs.update({"optimize": True})
+    out.save(buf, **save_kwargs)
+    return out, buf.getvalue(), ext, media_type
+
+
+def _looks_like_image_artifact(pil_img) -> bool:
+    """Descarta máscaras/artefactos del PDF que no son ilustraciones reales."""
+    from PIL import ImageStat
+
+    try:
+        rgb = pil_img.convert("RGB")
+        width, height = rgb.size
+        area = width * height
+        stat = ImageStat.Stat(rgb)
+        # Artefactos típicos: muy pequeños y casi uniformes (negro/gris sólido).
+        avg_std = sum(stat.stddev[:3]) / 3.0
+        avg_mean = sum(stat.mean[:3]) / 3.0
+
+        if area <= 50000 and avg_std < 3.0:
+            return True
+        if max(width, height) <= 220 and avg_std < 4.0:
+            return True
+        # Bloques oscuros/claros casi uniformes y pequeños.
+        if area <= 120000 and avg_std < 2.0 and (avg_mean < 8 or avg_mean > 247):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _filter_decorative_images(images: list[dict], total_pages: int) -> tuple[list[dict], list[dict]]:
     """
     Omite imágenes repetidas y pequeñas que suelen ser adornos de pie de página,
@@ -643,24 +704,10 @@ def extract_pdf_content(pdf_path: str) -> tuple[list[str], list[dict]]:
             img_counter += 1
             try:
                 pil_img = img_obj.image
-                fmt = pil_img.format or "JPEG"
+                safe_img, img_data, ext, media_type = _encode_image_for_epub(pil_img)
 
-                ext = "jpg"
-                media_type = "image/jpeg"
-                if fmt.upper() == "PNG":
-                    ext = "png"
-                    media_type = "image/png"
-                elif fmt.upper() == "GIF":
-                    ext = "gif"
-                    media_type = "image/gif"
-                elif fmt.upper() == "WEBP":
-                    fmt = "JPEG"
-
-                buf = io.BytesIO()
-                if pil_img.mode in ("RGBA", "P") and fmt.upper() == "JPEG":
-                    pil_img = pil_img.convert("RGB")
-                pil_img.save(buf, format=fmt.upper() if fmt.upper() != "WEBP" else "JPEG")
-                img_data = buf.getvalue()
+                if _looks_like_image_artifact(safe_img):
+                    continue
 
                 images.append({
                     "page_idx":     page_idx,
@@ -670,8 +717,8 @@ def extract_pdf_content(pdf_path: str) -> tuple[list[str], list[dict]]:
                     "media_type":   media_type,
                     "is_full_page": is_full_page,
                     "caption":      caption,
-                    "width":        pil_img.width,
-                    "height":       pil_img.height,
+                    "width":        safe_img.width,
+                    "height":       safe_img.height,
                 })
             except Exception as ex:
                 print(f"  [Imágenes] ⚠️  No se pudo extraer imagen en pág {page_idx+1}: {ex}")
@@ -703,9 +750,36 @@ def extract_pdf_text(pdf_path: str) -> list[str]:
 HEADER_FOOTER_MIN_REPEAT = 4  # aparece en al menos N páginas = candidato a header/footer
 VARIABLE_PAGE_LINE_RE = re.compile(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9 .:'’_\-]{3,80}\s*\|\s*\d{1,4}$")
 STRUCTURAL_HEADING_RE = re.compile(
-    r'^(?:cap[ií]tulo(?:\s+\d+)?|parte(?:\s+\d+)?|pr[oó]logo|ep[ií]logo|afterword|agradecimientos?)\b',
+    r'^[\-—–―|\s]*'
+    r'(?:cap[ií]tulo(?:\s+(?:\d+|extra|especial))?|chapter(?:\s+(?:\d+|extra|special))?|'
+    r'parte(?:\s+\d+)?|pr[oó]logo|prologue|ep[ií]logo|afterword|short\s+story|'
+    r'palabras del autor|agradecimientos?|acknowledgements?)\b',
     re.IGNORECASE,
 )
+
+
+def is_structural_heading_line(line: str) -> bool:
+    s = _normalize_heading_text(line)
+    return bool(s and STRUCTURAL_HEADING_RE.match(s))
+
+
+def looks_like_section_subtitle(line: str) -> bool:
+    s = _normalize_heading_text(line)
+    if not s or is_structural_heading_line(s):
+        return False
+    if len(s) > 120 or len(s.split()) > 14:
+        return False
+    if re.search(r'\.{2,}\s*\d{1,4}$', s):
+        return False
+    if '|' in s and re.search(r'\d{1,4}$', s):
+        return False
+    if re.fullmatch(r'\d{1,4}', s):
+        return False
+    if re.match(r'^(?:cap[ií]tulo|chapter|parte|pr[oó]logo|ep[ií]logo|afterword|short\s+story)\b', s, re.IGNORECASE):
+        return False
+    words = [w for w in re.split(r'\s+', s) if w]
+    titled = sum(1 for w in words if re.match(r'^[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]+', w))
+    return titled >= max(1, len(words) // 2)
 
 
 def normalize_header_footer_candidate(line: str) -> str:
@@ -713,33 +787,26 @@ def normalize_header_footer_candidate(line: str) -> str:
     s = re.sub(r'\s+', ' ', (line or '').strip())
     if not s:
         return ''
-    if STRUCTURAL_HEADING_RE.match(s):
+    if is_structural_heading_line(s):
         return ''
 
-    # Número de página suelto o rodeado por adornos: — 15 — / - 15 - / 15
     if re.fullmatch(r'[\-–—\s]*\d{1,4}[\-–—\s]*', s):
         return '<PAGE_NUM>'
 
-    # Página 15 / Pag. 15 / pág. 15
     s = re.sub(r'\b(P[áa]g(?:ina)?\.?\s*)\d{1,4}\b', r'\1<PAGE_NUM>', s, flags=re.IGNORECASE)
 
-    # Texto fijo | número
     if VARIABLE_PAGE_LINE_RE.fullmatch(s):
         s = re.sub(r'\d{1,4}\s*$', '<PAGE_NUM>', s)
 
-    # Caso decorado puro una vez sustituido.
     if re.fullmatch(r'[\-–—\s]*<PAGE_NUM>[\-–—\s]*', s):
         return '<PAGE_NUM>'
 
-    # Otras líneas con número variable conservando el texto fijo.
     s = re.sub(r'(?<!\w)\d{1,4}(?!\w)', '<PAGE_NUM>', s)
     s = re.sub(r'\s+', ' ', s).strip()
 
-    if STRUCTURAL_HEADING_RE.match(s):
+    if is_structural_heading_line(s):
         return ''
     return s
-
-
 def detect_repeated_lines(pages: list[str]) -> tuple[set[str], set[str]]:
     """Detecta líneas repetidas exactas y líneas repetidas tras normalización."""
     from collections import Counter
@@ -756,7 +823,7 @@ def detect_repeated_lines(pages: list[str]) -> tuple[set[str], set[str]]:
             stripped = re.sub(r'\s+', ' ', line.strip())
             if not stripped or len(stripped) <= 2:
                 continue
-            if STRUCTURAL_HEADING_RE.match(stripped):
+            if is_structural_heading_line(stripped):
                 continue
             if stripped not in seen_exact:
                 exact_count[stripped] += 1
@@ -833,7 +900,7 @@ def clean_text_per_page(raw_pages: list[str], config: dict) -> list[list[str]]:
                 should_remove = True
 
             # No eliminar headings narrativos legítimos.
-            if should_remove and STRUCTURAL_HEADING_RE.match(stripped):
+            if should_remove and is_structural_heading_line(stripped):
                 should_remove = False
 
             if should_remove:
@@ -852,51 +919,68 @@ def reconstruct_paragraphs(lines: list[str], config: dict) -> list[str]:
     Reconstruye párrafos a partir de líneas sueltas.
     Heurísticas:
     - Línea vacía → salto de párrafo definitivo
+    - Línea estructural (Prólogo / Capítulo / Parte / etc.) → párrafo propio
+    - Línea de subtítulo tras heading estructural → párrafo propio
     - Línea que termina con guión de silabeo → unir con la siguiente
-    - Línea que termina sin punto y la siguiente empieza en minúscula → unir
     - Línea que termina en punto/interrogación/exclamación → párrafo completo
     """
     paragraphs: list[str] = []
     current: list[str] = []
 
-    END_PUNCTUATION = re.compile(r'[.!?»"\'—\u201d\u2019]$')
-    DIALOG_START    = re.compile(r'^[—–\-"«\u201c\u2018]')
-    SENTENCE_START  = re.compile(r'^[A-ZÁÉÍÓÚÜÑ"«\u201c\u2018—–]')
-    HYPHEN_END      = re.compile(r'-$')
+    END_PUNCTUATION = re.compile(r"[.!?»\"'—\u201d\u2019]$")
+    DIALOG_START = re.compile(r'^[—–\-"«\u201c\u2018]')
+    SENTENCE_START = re.compile(r'^[A-ZÁÉÍÓÚÜÑ"«\u201c\u2018—–]')
+    HYPHEN_END = re.compile(r'-$')
 
+    prev_nonempty = ""
     i = 0
     while i < len(lines):
-        line = lines[i]
+        line = lines[i].strip()
 
         if line == "":
-            # Línea vacía → cierra párrafo actual
             if current:
                 paragraphs.append(" ".join(current))
                 current = []
             i += 1
             continue
 
-        # Guión de silabeo al final
-        if HYPHEN_END.search(line) and i + 1 < len(lines) and lines[i + 1]:
-            next_line = lines[i + 1]
+        if is_structural_heading_line(line):
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            paragraphs.append(_normalize_heading_text(line))
+            prev_nonempty = _normalize_heading_text(line)
+            i += 1
+            continue
+
+        if prev_nonempty and is_structural_heading_line(prev_nonempty) and looks_like_section_subtitle(line):
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            paragraphs.append(_normalize_heading_text(line))
+            prev_nonempty = _normalize_heading_text(line)
+            i += 1
+            continue
+
+        if HYPHEN_END.search(line) and i + 1 < len(lines) and lines[i + 1].strip():
+            next_line = lines[i + 1].strip()
             if next_line and next_line[0].islower():
-                # Unir sin espacio (la palabra estaba partida)
                 current.append(line[:-1] + next_line)
+                prev_nonempty = next_line
                 i += 2
                 continue
 
         current.append(line)
+        prev_nonempty = line
 
-        # ¿Cerrar párrafo?
         close_paragraph = False
-
-        # Termina con puntuación fuerte
         if END_PUNCTUATION.search(line):
             close_paragraph = True
-        # La siguiente línea empieza con mayúscula o diálogo → nuevo párrafo
-        elif i + 1 < len(lines) and lines[i + 1]:
-            next_line = lines[i + 1]
-            if SENTENCE_START.match(next_line) or DIALOG_START.match(next_line):
+        elif i + 1 < len(lines) and lines[i + 1].strip():
+            next_line = lines[i + 1].strip()
+            if is_structural_heading_line(next_line):
+                close_paragraph = True
+            elif SENTENCE_START.match(next_line) or DIALOG_START.match(next_line):
                 close_paragraph = True
 
         if close_paragraph:
@@ -908,7 +992,6 @@ def reconstruct_paragraphs(lines: list[str], config: dict) -> list[str]:
     if current:
         paragraphs.append(" ".join(current))
 
-    # Filtrar párrafos vacíos o de una sola palabra (residuos)
     result = []
     for p in paragraphs:
         p = p.strip()
@@ -916,25 +999,28 @@ def reconstruct_paragraphs(lines: list[str], config: dict) -> list[str]:
             result.append(p)
     return result
 
-
 # ─────────────────────────────────────────────
 #  DETECCIÓN DE CAPÍTULOS
 # ─────────────────────────────────────────────
 
-# Patrones de inicio de capítulo (en orden de prioridad)
 CHAPTER_PATTERNS = [
-    # "Capítulo 1", "Capítulo 1:", "Capítulo 1 - Título"
     re.compile(
-        r'^(?:CAPÍTULO|CAPITULO|Capítulo|Capitulo|CHAPTER|Chapter|CAP\.|Cap\.)\s*'
-        r'(\d+|[IVXLCDM]+)'
-        r'(?:\s*[:.\-–—]\s*(.+))?$',
+        r'^[\-—–―|\s]*'
+        r'(?:CAPÍTULO|CAPITULO|Capítulo|Capitulo|CHAPTER|Chapter|CAP\.|Cap\.)\s*'
+        r'(\d+|[IVXLCDM]+|EXTRA|ESPECIAL)'
+        r'(?:\s*[:.\-–—|]\s*(.+))?'
+        r'[\-—–―|\s]*$',
         re.IGNORECASE
     ),
-    # "1. Título" o "1.- Título"
-    re.compile(r'^(\d{1,3})[.\-–]\s+([A-ZÁÉÍÓÚ].{3,})$'),
-    # Secciones especiales
     re.compile(
-        r'^(Prólogo|Prolog|Epílogo|Epilogo|Interludio|Interlúdio|Interludio|'
+        r'^[\-—–―|\s]*(?:PARTE|Parte|PART)\s*(\d+|[IVXLCDM]+)'
+        r'(?:\s*[:.\-–—|]\s*(.+))?[\-—–―|\s]*$',
+        re.IGNORECASE
+    ),
+    re.compile(r'^[\-—–―|\s]*(?:SHORT\s+STORY|Short\s+Story)[\-—–―|\s]*$', re.IGNORECASE),
+    re.compile(r'^(\d{1,3})[.\-–]\s+([A-ZÁÉÍÓÚ].{3,})$'),
+    re.compile(
+        r'^[\-—–―|\s]*(Prólogo|Prolog|Epílogo|Epilogo|Interludio|Interlúdio|Interludio|'
         r'Prefacio|Presentación|Presentacion|Introducción|Introduccion|'
         r'Palabras del autor|Afterword|Foreword|Omake|Extra|Agradecimiento|Agradecimientos|Acknowledgement|Acknowledgements)\b',
         re.IGNORECASE
@@ -946,6 +1032,8 @@ SPECIAL_SECTION_PATTERNS = [
     ("epilogue", re.compile(r'^(?:epílogo|epilogo)\b', re.IGNORECASE)),
     ("afterword", re.compile(r'^(?:afterword|palabras del autor)\b', re.IGNORECASE)),
     ("acknowledgements", re.compile(r'^(?:agradecimiento|agradecimientos|acknowledgement|acknowledgements)\b', re.IGNORECASE)),
+    ("short_story", re.compile(r'^(?:short\s+story)\b', re.IGNORECASE)),
+    ("part", re.compile(r'^(?:parte)\s+(?:\d+|[ivxlcdm]+)\b', re.IGNORECASE)),
     ("extra", re.compile(r'^(?:omake|extra)\b', re.IGNORECASE)),
 ]
 
@@ -958,7 +1046,6 @@ TOC_KEYWORDS = (
 def _normalize_heading_text(text: str) -> str:
     text = (text or "").replace(" ", " ")
     text = re.sub(r'\s+', ' ', text).strip()
-    # Quita decoración común en novelas ligeras: ― TÍTULO ― / — TÍTULO — / | TÍTULO |
     text = re.sub(r'^[\-—–―|\s]+', '', text)
     text = re.sub(r'[\-—–―|\s]+$', '', text)
     return text.strip()
@@ -975,7 +1062,7 @@ def _toc_entry_score(text: str) -> int:
     has_section_name = bool(re.search(r'(cap[ií]tulo|chapter|prólogo|prologo|ep[ií]logo|epilogo|afterword|palabras del autor|agradecimiento)', lower))
     has_leaders = bool(re.search(r'\.{2,}\s*\d{1,4}$', text))
     has_pipe = '|' in text
-    trailing_page = bool(re.search(r'\d{1,4}$', text))
+    trailing_page = bool(re.search(r'\b\d{1,4}$', text))
 
     if any(k in lower for k in TOC_KEYWORDS):
         score += 4
@@ -1001,7 +1088,7 @@ def _is_probable_toc_page(page_paragraphs: list[str]) -> bool:
     strong = sum(1 for s in scores if s >= 3)
     medium = sum(1 for s in scores if s >= 2)
     chapter_mentions = len(re.findall(r'(cap[ií]tulo|chapter|pr[óo]logo|ep[ií]logo|afterword)', lower))
-    page_numbers = len(re.findall(r'\d{1,4}', lower))
+    page_numbers = len(re.findall(r'\b\d{1,4}\b', lower))
     leader_count = len(re.findall(r'\.{2,}', joined))
     return (
         strong >= 2
@@ -1065,53 +1152,79 @@ def _format_special_heading(kind: str, text: str) -> str:
         return 'Afterword' if text.lower().startswith('afterword') else 'Palabras del autor'
     if kind == 'acknowledgements':
         return 'Agradecimiento' if text.lower().startswith('agradecimiento') else 'Agradecimientos'
+    if kind == 'short_story':
+        return 'Short Story'
+    if kind == 'part':
+        m = re.search(r'(\d+|[IVXLCDM]+)', text, re.IGNORECASE)
+        return f"Parte {m.group(1)}" if m else 'Parte'
     return text or 'Extra'
-
-
 def _detect_page_heading(page_paragraphs: list[str], allow_terminal: bool = True) -> dict | None:
-    candidates = [_normalize_heading_text(p) for p in page_paragraphs[:4] if _normalize_heading_text(p)]
+    candidates = [_normalize_heading_text(p) for p in page_paragraphs[:5] if _normalize_heading_text(p)]
     if not candidates:
         return None
 
-    first = candidates[0]
-    if _toc_entry_score(first) >= 3 and _is_probable_toc_page(candidates):
+    if _toc_entry_score(candidates[0]) >= 3 and _is_probable_toc_page(candidates):
         return None
+
+    heading_idx = 0
+    for idx, cand in enumerate(candidates[:4]):
+        if any(pat.match(cand) for _, pat in SPECIAL_SECTION_PATTERNS) or CHAPTER_PATTERNS[0].match(cand) or CHAPTER_PATTERNS[1].match(cand) or CHAPTER_PATTERNS[2].match(cand):
+            heading_idx = idx
+            break
+    first = candidates[heading_idx]
+    rest = candidates[heading_idx + 1:]
 
     for kind, pattern in SPECIAL_SECTION_PATTERNS:
         if kind in {'epilogue', 'afterword', 'acknowledgements'} and not allow_terminal:
             continue
         if pattern.match(first) and _looks_like_short_heading(first):
-            consume = 1
+            consume = heading_idx + 1
             subtitle = ''
-            if len(candidates) > 1 and _looks_like_short_heading(candidates[1]) and _toc_entry_score(candidates[1]) < 2:
-                second_is_same_special = any(pat.match(candidates[1]) for _, pat in SPECIAL_SECTION_PATTERNS)
-                if kind == 'afterword' and re.match(r'^(?:palabras del autor)$', candidates[1], re.IGNORECASE):
-                    subtitle = candidates[1]
-                    consume = 2
-                elif not second_is_same_special and not CHAPTER_PATTERNS[0].match(candidates[1]):
-                    if len(candidates[1].split()) <= 12:
-                        subtitle = candidates[1]
-                        consume = 2
+            if rest and looks_like_section_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
+                second_is_same_special = any(pat.match(rest[0]) for _, pat in SPECIAL_SECTION_PATTERNS)
+                if kind == 'afterword' and re.match(r'^(?:palabras del autor)$', rest[0], re.IGNORECASE):
+                    subtitle = rest[0]
+                    consume += 1
+                elif not second_is_same_special and not CHAPTER_PATTERNS[0].match(rest[0]):
+                    subtitle = rest[0]
+                    consume += 1
             return {'kind': kind, 'title': _format_special_heading(kind, first), 'subtitle': subtitle, 'consume': consume}
 
     m = CHAPTER_PATTERNS[0].match(first)
     if m and _looks_like_short_heading(first):
+        label = m.group(1)
         subtitle = (m.group(2) or '').strip()
-        consume = 1
-        if not subtitle and len(candidates) > 1 and _looks_like_short_heading(candidates[1]) and _toc_entry_score(candidates[1]) < 2:
-            if not any(pat.match(candidates[1]) for _, pat in SPECIAL_SECTION_PATTERNS) and not CHAPTER_PATTERNS[0].match(candidates[1]):
-                if len(candidates[1].split()) <= 12:
-                    subtitle = candidates[1]
-                    consume = 2
-        return {'kind': 'chapter', 'title': f'Capítulo {m.group(1)}', 'subtitle': subtitle, 'consume': consume}
+        consume = heading_idx + 1
+        if not subtitle and rest and looks_like_section_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
+            if not any(pat.match(rest[0]) for _, pat in SPECIAL_SECTION_PATTERNS) and not CHAPTER_PATTERNS[0].match(rest[0]):
+                subtitle = rest[0]
+                consume += 1
+        title = f'Capítulo {label.title() if str(label).isalpha() else label}'
+        return {'kind': 'chapter', 'title': title, 'subtitle': subtitle, 'consume': consume}
 
     m = CHAPTER_PATTERNS[1].match(first)
     if m and _looks_like_short_heading(first):
-        return {'kind': 'chapter', 'title': f'Capítulo {m.group(1)}', 'subtitle': (m.group(2) or '').strip(), 'consume': 1}
+        label = m.group(1)
+        subtitle = (m.group(2) or '').strip()
+        consume = heading_idx + 1
+        if not subtitle and rest and looks_like_section_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
+            subtitle = rest[0]
+            consume += 1
+        return {'kind': 'part', 'title': f'Parte {label}', 'subtitle': subtitle, 'consume': consume}
+
+    if CHAPTER_PATTERNS[2].match(first):
+        subtitle = ''
+        consume = heading_idx + 1
+        if rest and looks_like_section_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
+            subtitle = rest[0]
+            consume += 1
+        return {'kind': 'short_story', 'title': 'Short Story', 'subtitle': subtitle, 'consume': consume}
+
+    m = CHAPTER_PATTERNS[3].match(first)
+    if m and _looks_like_short_heading(first):
+        return {'kind': 'chapter', 'title': f'Capítulo {m.group(1)}', 'subtitle': (m.group(2) or '').strip(), 'consume': heading_idx + 1}
 
     return None
-
-
 def detect_chapters(full_text: str, config: dict,
                     pages_paragraphs: list | None = None) -> tuple:
     """
@@ -1400,10 +1513,13 @@ def chapter_fragment_to_xhtml(chapter: dict, start_idx: int, end_idx: int,
 
     body_parts = []
     if include_header:
-        if subtitle:
-            body_parts.append(f'<h1>{escape_xml(title)}:<br/>{escape_xml(subtitle)}</h1>')
+        section_kind = chapter.get("section_kind", "chapter")
+        if section_kind == "part":
+            body_parts.append(f'<h3 class="part-title">{escape_xml(title)}</h3>')
         else:
-            body_parts.append(f'<h1>{escape_xml(title)}</h1>')
+            body_parts.append(f'<h1 class="chapter-title">{escape_xml(title)}</h1>')
+        if subtitle:
+            body_parts.append(f'<h2 class="chapter-subtitle">{escape_xml(subtitle)}</h2>')
 
     suppress_images = suppress_images or set()
     img_by_pos: dict[int, list] = {}
