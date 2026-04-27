@@ -62,7 +62,7 @@ run_gui.bat
 
 ------------------------------------------------------------------------
 
-## 🔧 Mejoras recientes (importante)
+## 🔧 Mejoras recientes
 
 ### 🖼️ Manejo de imágenes mejorado
 
@@ -80,8 +80,7 @@ Tradeoff: - layout inicial de imágenes más controlado - menos
 
 ### 🧹 Limpieza de headers/footers
 
--   Eliminación mejorada de líneas repetidas como:
-    -   `Einherjar Project | 15`
+-   Eliminación mejorada de líneas repetidas
 -   Detección por patrón (no solo coincidencia exacta)
 
 ------------------------------------------------------------------------
