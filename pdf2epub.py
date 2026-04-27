@@ -2194,15 +2194,47 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
 
         if pg_idx in full_page_img_map:
             flush_segment()
-            # Compatibilidad amplia con lectores EPUB: cada página visual completa
-            # se emite como XHTML independiente, en lugar de agrupar varias
-            # ilustraciones consecutivas dentro de una sola galería.
-            #
-            # En varios lectores móviles, una galería con múltiples imágenes grandes
-            # puede renderizar bien la primera y fallar visualmente con las siguientes
-            # (bloques negros, áreas vacías o miniaturas corruptas) aunque el archivo
-            # de imagen sea correcto. Separarlas por página hace el resultado mucho
-            # más estable para PDFs variados, no solo para este caso concreto.
+
+            # Intento conservador de compactación: para front matter puramente visual
+            # (sin mapeo a capítulo) permitimos agrupar COMO MÁXIMO dos páginas
+            # visuales consecutivas en un solo XHTML simple. Esto recupera parte de
+            # la compactación previa sin volver a las galerías largas que rompían la
+            # compatibilidad en lectores móviles. Si hay cualquier duda, se mantiene
+            # una imagen por XHTML.
+            def _can_compact_front_visual(page_index: int) -> bool:
+                if page_index in excluded_pages or page_index in consumed_full_pages:
+                    return False
+                if cover_page_idx is not None and page_index == cover_page_idx:
+                    return False
+                if page_index not in full_page_img_map:
+                    return False
+                mapped_ch = page_to_chapter[page_index] if page_index < len(page_to_chapter) else -1
+                if mapped_ch >= 0:
+                    return False
+                imgs = full_page_img_map.get(page_index, [])
+                if len(imgs) != 1:
+                    return False
+                img = imgs[0]
+                width = int(img.get("width") or 0)
+                height = int(img.get("height") or 0)
+                if width <= 0 or height <= 0:
+                    return False
+                ratio = max(width, height) / max(1, min(width, height))
+                # No compactar imágenes extremadamente altas/verticales ni muy grandes.
+                if ratio > 1.9:
+                    return False
+                if width * height > 3_000_000:
+                    return False
+                return True
+
+            if _can_compact_front_visual(pg_idx) and _can_compact_front_visual(pg_idx + 1):
+                spine_items.append({
+                    "type": "img_sequence",
+                    "images": [full_page_img_map[pg_idx][0], full_page_img_map[pg_idx + 1][0]],
+                })
+                pg_idx += 2
+                continue
+
             for fimg in full_page_img_map[pg_idx]:
                 spine_items.append({"type": "img_page", "image": fimg})
             pg_idx += 1
@@ -2309,9 +2341,9 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
     else:
         print("  [EPUB] Validación de fragmentos: sin solapamientos sospechosos")
 
-    sequence_count = sum(1 for s in spine_items if s["type"] == "img_page")
+    sequence_count = sum(1 for s in spine_items if s["type"] in {"img_page", "img_sequence"})
     inline_img_count = sum(len(ch.get("inline_images", [])) for ch in chapters)
-    print(f"  [EPUB] Imágenes: {sequence_count} página(s) visual(es), {inline_img_count} integradas en texto")
+    print(f"  [EPUB] Imágenes: {sequence_count} bloque(s) visual(es), {inline_img_count} integradas en texto")
 
     book_uuid = str(uuid.uuid4())
 
@@ -2365,10 +2397,7 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
                 ip_id = f"imgpage{visual_counter:03d}"
                 img = item["image"]
                 title = img.get("caption") or f"Ilustración {visual_counter}"
-                caption_html = (
-                    f'<p class="centrado"><i>{escape_xml(img.get("caption", ""))}</i></p>'
-                    if img.get("caption") else ""
-                )
+                caption_html = f'\n<p class="centrado"><i>{escape_xml(img.get("caption", ""))}</i></p>' if img.get("caption") else ""
                 zf.writestr(
                     f"OEBPS/Text/{ip_filename}",
                     XHTML_IMAGE_PAGE_TEMPLATE.format(
@@ -2378,6 +2407,18 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
                         imgname=img["name"],
                         caption_html=caption_html,
                     ),
+                )
+                manifest_items.append({"id": ip_id, "href": f"Text/{ip_filename}",
+                                       "media_type": "application/xhtml+xml"})
+                spine_idrefs.append(ip_id)
+            elif item["type"] == "img_sequence":
+                visual_counter += 1
+                ip_filename = f"img_{visual_counter:03d}.xhtml"
+                ip_id = f"imgpage{visual_counter:03d}"
+                title = f"Ilustraciones {visual_counter}"
+                zf.writestr(
+                    f"OEBPS/Text/{ip_filename}",
+                    build_image_sequence_xhtml(item["images"], lang=lang, title=escape_xml(title)),
                 )
                 manifest_items.append({"id": ip_id, "href": f"Text/{ip_filename}",
                                        "media_type": "application/xhtml+xml"})
