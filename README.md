@@ -42,8 +42,7 @@ Este convertidor no busca solo "sacar texto del PDF", sino:
 -   `pdf2epub.py`: motor principal PDF → EPUB
 -   `gui.py`: interfaz web local
 -   `requirements.txt`: dependencias Python
--   `run_gui.bat`: lanzador automático (recomendado)
--   `run_cli_example.bat`: ejemplo por consola
+-   `run_gui.bat`: lanzador automático
 
 ------------------------------------------------------------------------
 
