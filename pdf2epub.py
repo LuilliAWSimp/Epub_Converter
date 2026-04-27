@@ -12,6 +12,7 @@ Dependencias: pypdf pdfminer.six PyMuPDF pytesseract pillow
 
 import argparse
 import io
+import math
 import json
 import hashlib
 import os
@@ -110,36 +111,33 @@ small { font-size: 0.8em; }
 
 /* === IMÁGENES === */
 img {
+    display: block;
     max-width: 100%;
-    max-height: 95vh;
     width: auto;
     height: auto;
-    margin-top: 0;
-    margin-right: auto;
-    margin-bottom: 0;
-    margin-left: auto;
+    margin: 0 auto;
     page-break-inside: avoid;
     break-inside: avoid;
-    object-fit: contain;
+    border: 0;
 }
 div.dimg {
     width: auto;
     height: auto;
     max-width: 100%;
-    margin-right: auto;
-    margin-left: auto;
+    margin: 1em auto;
     line-height: 0;
     text-align: center;
-    margin-top: 1em;
-    margin-bottom: 1em;
+    page-break-inside: avoid;
+    break-inside: avoid;
 }
 div.dimg.fullblock img {
-    max-height: 80vh;
+    max-width: 100%;
+    height: auto;
 }
 div.pagina  { width: 100%; height: auto; text-align: center; }
 div.seguida { width: 100%; height: auto; }
 div.galeria { width: 100%; height: auto; text-align: center; }
-div.galeria .dimg { margin-top: 0.6em; margin-bottom: 0.6em; }
+div.galeria .dimg { margin-top: 0.8em; margin-bottom: 0.8em; }
 
 /* === ALINEACIÓN === */
 .centrado,  .centrado p  { text-align: center; text-indent: 0; }
@@ -466,63 +464,231 @@ def _decorative_image_hash(img: dict) -> str:
     return hashlib.sha1(img.get("data", b"")).hexdigest()
 
 
-def _encode_image_for_epub(pil_img):
-    """Convierte cualquier imagen extraída del PDF a un formato seguro para EPUB.
-    Evita dejar JPEG2000/JPX u otros formatos internos con extensión engañosa.
+def _flatten_image_for_mobile_compat(pil_img, background=(255, 255, 255)):
+    """Aplana cualquier alpha/transparencia y normaliza a RGB.
+
+    Varios lectores EPUB móviles renderizan mal PNGs con alpha o imágenes
+    extraídas desde streams PDF con composición compleja, produciendo bloques
+    negros o zonas vacías. Para máxima compatibilidad, aquí se rasteriza todo a
+    un bitmap RGB simple sobre fondo sólido.
     """
     from PIL import Image
 
+    if pil_img.mode not in ("RGB", "RGBA", "LA", "L"):
+        pil_img = pil_img.convert("RGBA") if 'A' in pil_img.mode else pil_img.convert("RGB")
+
     if pil_img.mode in ("RGBA", "LA"):
-        # PNG conserva alpha y es ampliamente compatible.
-        out = pil_img.convert("RGBA")
-        fmt = "PNG"
-        ext = "png"
-        media_type = "image/png"
-    else:
-        if pil_img.mode not in ("RGB", "L"):
-            out = pil_img.convert("RGB")
-        elif pil_img.mode == "L":
-            out = pil_img.convert("RGB")
-        else:
-            out = pil_img
-        fmt = "JPEG"
-        ext = "jpg"
-        media_type = "image/jpeg"
+        rgba = pil_img.convert("RGBA")
+        base = Image.new("RGB", rgba.size, background)
+        base.paste(rgba, mask=rgba.getchannel("A"))
+        return base
+
+    if pil_img.mode == "L":
+        return pil_img.convert("RGB")
+
+    return pil_img.convert("RGB")
+
+
+def _encode_image_for_epub(pil_img):
+    """Convierte cualquier imagen extraída del PDF a un formato muy compatible.
+
+    Para evitar diferencias entre lectores de laptop y móvil, todas las imágenes
+    terminan como JPEG RGB baseline estándar, sin alpha ni formatos internos del
+    PDF (JPX/JPEG2000, máscaras, etc.).
+    """
+    out = _flatten_image_for_mobile_compat(pil_img)
+    fmt = "JPEG"
+    ext = "jpg"
+    media_type = "image/jpeg"
 
     buf = io.BytesIO()
-    save_kwargs = {"format": fmt}
-    if fmt == "JPEG":
-        save_kwargs.update({"quality": 95, "optimize": True})
-    else:
-        save_kwargs.update({"optimize": True})
-    out.save(buf, **save_kwargs)
+    out.save(
+        buf,
+        format=fmt,
+        quality=92,
+        progressive=False,
+        optimize=False,
+        subsampling=0,
+    )
     return out, buf.getvalue(), ext, media_type
 
 
 def _looks_like_image_artifact(pil_img) -> bool:
-    """Descarta máscaras/artefactos del PDF que no son ilustraciones reales."""
+    """Descarta máscaras/artefactos del PDF que no son ilustraciones reales.
+
+    Heurística conservadora y sin dependencias extra.
+    Busca especialmente:
+    - bloques grises/negros casi uniformes
+    - máscaras parciales con esquinas transparentes
+    - recursos pequeños o medianos con muy poco detalle real
+    """
     from PIL import ImageStat
 
-    try:
-        rgb = pil_img.convert("RGB")
-        width, height = rgb.size
-        area = width * height
-        stat = ImageStat.Stat(rgb)
-        # Artefactos típicos: muy pequeños y casi uniformes (negro/gris sólido).
-        avg_std = sum(stat.stddev[:3]) / 3.0
-        avg_mean = sum(stat.mean[:3]) / 3.0
+    def _entropy_from_hist(hist):
+        total = float(sum(hist) or 1.0)
+        ent = 0.0
+        for c in hist:
+            if c:
+                p = c / total
+                ent -= p * math.log2(p)
+        return ent
 
-        if area <= 50000 and avg_std < 3.0:
+    try:
+        rgba = pil_img.convert("RGBA")
+        width, height = rgba.size
+        area = width * height
+        if area <= 0:
             return True
-        if max(width, height) <= 220 and avg_std < 4.0:
+
+        rgb = rgba.convert("RGB")
+        gray = rgb.convert("L")
+        hsv = rgb.convert("HSV")
+
+        rgb_stat = ImageStat.Stat(rgb)
+        gray_stat = ImageStat.Stat(gray)
+        hsv_stat = ImageStat.Stat(hsv)
+
+        avg_std = sum(rgb_stat.stddev[:3]) / 3.0
+        avg_mean = sum(rgb_stat.mean[:3]) / 3.0
+        sat_mean = float(hsv_stat.mean[1])
+        sat_std = float(hsv_stat.stddev[1])
+        gray_entropy = _entropy_from_hist(gray.histogram())
+
+        # Detección explícita de recursos "basura" del PDF:
+        # máscaras negras/grises, overlays mínimos o imágenes casi monocromas
+        # de muy pocos bytes. El caso problemático real del PDF de prueba cae aquí.
+        try:
+            color_probe = rgba.getcolors(maxcolors=8)
+        except Exception:
+            color_probe = None
+        color_count = None if color_probe is None else len(color_probe)
+        raw_bbox = rgba.getbbox()
+        if raw_bbox is None:
             return True
-        # Bloques oscuros/claros casi uniformes y pequeños.
-        if area <= 120000 and avg_std < 2.0 and (avg_mean < 8 or avg_mean > 247):
+
+        # Conteo de colores más fino para recursos pequeños/medianos.
+        rich_color_count = None
+        dominant_ratio = 0.0
+        if area <= 50000:
+            try:
+                rich_probe = rgba.getcolors(maxcolors=min(262144, area + 1))
+            except Exception:
+                rich_probe = None
+            if rich_probe:
+                rich_color_count = len(rich_probe)
+                dominant_ratio = max(count for count, _ in rich_probe) / float(area)
+
+        if color_count is not None and color_count <= 2:
+            # Recurso casi monocromático: si además es relativamente pequeño
+            # o de muy pocos bytes visuales, es casi seguro un artefacto.
+            if area <= 120000:
+                return True
+            if avg_std < 3.0 and gray_entropy < 1.2:
+                return True
+
+        if avg_std < 2.0 and gray_entropy < 0.8 and area <= 180000:
             return True
+
+        # Caso muy específico del bloque gris: recurso pequeño, en escala de grises,
+        # con muy pocos colores reales y un tono dominante enorme.
+        if (
+            area <= 50000
+            and max(width, height) <= 240
+            and sat_mean < 1.5
+            and sat_std < 1.5
+            and rich_color_count is not None
+            and rich_color_count <= 160
+            and dominant_ratio >= 0.70
+        ):
+            return True
+
+        # Caso muy específico y común en estos PDFs:
+        # rectángulos negros/grises pequeños-medianos con un solo color útil.
+        if color_count == 1 and area <= 250000:
+            return True
+
+        # Casos muy pequeños y casi uniformes.
+        if area <= 50000 and avg_std < 6.0:
+            return True
+        if max(width, height) <= 220 and avg_std < 8.0:
+            return True
+
+        # Bloques casi vacíos, extremadamente oscuros o claros.
+        if area <= 180000 and avg_std < 5.0 and (avg_mean < 15 or avg_mean > 245):
+            return True
+
+        alpha = rgba.getchannel("A")
+        alpha_bbox = alpha.getbbox()
+        if alpha_bbox is None:
+            return True
+
+        visible_ratio = float((alpha_bbox[2] - alpha_bbox[0]) * (alpha_bbox[3] - alpha_bbox[1])) / float(area or 1)
+        alpha_crop = alpha.crop(alpha_bbox)
+        alpha_stat = ImageStat.Stat(alpha_crop)
+        alpha_mean = float(alpha_stat.mean[0])
+        alpha_std = float(alpha_stat.stddev[0])
+
+        rgb_crop = rgb.crop(alpha_bbox)
+        gray_crop = gray.crop(alpha_bbox)
+        hsv_crop = hsv.crop(alpha_bbox)
+
+        crop_stat = ImageStat.Stat(rgb_crop)
+        vis_mean = sum(crop_stat.mean[:3]) / 3.0
+        vis_std = sum(crop_stat.stddev[:3]) / 3.0
+        sat_crop_mean = float(ImageStat.Stat(hsv_crop).mean[1])
+        sat_crop_std = float(ImageStat.Stat(hsv_crop).stddev[1])
+        crop_entropy = _entropy_from_hist(gray_crop.histogram())
+
+        extrema = rgb_crop.getextrema()
+        channel_ranges = [mx - mn for (mn, mx) in extrema[:3]]
+
+        # M áscaras/stencils típicos del PDF: bloques negros o grises casi uniformes,
+        # con saturación bajísima y muy poco detalle.
+        if vis_std < 6.0 and sat_crop_mean < 8.0 and crop_entropy < 2.2 and area <= 250000:
+            return True
+
+        # Variante ligeramente más grande pero aún con muy poca información visual.
+        if vis_std < 10.0 and sat_crop_mean < 10.0 and crop_entropy < 2.6 and area <= 320000 and max(channel_ranges) <= 40:
+            return True
+
+        # Rectángulos redondeados / overlays con transparencia parcial.
+        # Esquinas muy transparentes + centro semitransparente + poca variación tonal.
+        corner_pts = [
+            (0, 0),
+            (max(0, width - 1), 0),
+            (0, max(0, height - 1)),
+            (max(0, width - 1), max(0, height - 1)),
+        ]
+        corner_alpha = [alpha.getpixel(pt) for pt in corner_pts]
+        center_alpha = alpha.getpixel((width // 2, height // 2))
+        if (
+            max(corner_alpha) < 25
+            and 25 < center_alpha < 245
+            and sat_mean < 10.0
+            and avg_std < 12.0
+            and gray_entropy < 2.8
+            and area <= 350000
+        ):
+            return True
+
+        # Imágenes casi uniformes con muy poca variación tonal y ocupación alta.
+        if max(channel_ranges) <= 6 and visible_ratio > 0.9 and crop_entropy < 2.0:
+            return True
+
+        # Recursos medianos de fondo gris/negro sin textura real.
+        if (
+            area <= 400000
+            and sat_mean < 8.0
+            and sat_std < 6.0
+            and gray_stat.stddev[0] < 12.0
+            and gray_entropy < 3.0
+            and avg_mean < 200
+        ):
+            return True
+
         return False
     except Exception:
         return False
-
 
 def _filter_decorative_images(images: list[dict], total_pages: int) -> tuple[list[dict], list[dict]]:
     """
@@ -1665,13 +1831,10 @@ def _image_bytes_to_jpeg_bytes(image_bytes: bytes) -> bytes:
     from PIL import Image
 
     img = Image.open(io.BytesIO(image_bytes))
-    if img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
-    elif img.mode == "L":
-        img = img.convert("RGB")
+    img = _flatten_image_for_mobile_compat(img)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=95)
+    img.save(buf, format="JPEG", quality=92, progressive=False, optimize=False, subsampling=0)
     return buf.getvalue()
 
 
@@ -2031,25 +2194,51 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
 
         if pg_idx in full_page_img_map:
             flush_segment()
-            seq = []
-            scan = pg_idx
-            while scan < n_pages:
-                if scan in excluded_pages or scan in consumed_full_pages:
-                    break
-                if cover_page_idx is not None and scan == cover_page_idx:
-                    break
-                scan_ch = page_to_chapter[scan] if scan < len(page_to_chapter) else -1
-                scan_range = page_para_ranges.get((scan_ch, scan)) if scan_ch >= 0 else None
-                if scan_range is not None:
-                    break
-                if scan not in full_page_img_map:
-                    break
-                seq.extend(full_page_img_map[scan])
-                scan += 1
-            if seq:
-                spine_items.append({"type": "img_sequence", "images": seq})
-                pg_idx = scan
+
+            # Intento conservador de compactación: para front matter puramente visual
+            # (sin mapeo a capítulo) permitimos agrupar COMO MÁXIMO dos páginas
+            # visuales consecutivas en un solo XHTML simple. Esto recupera parte de
+            # la compactación previa sin volver a las galerías largas que rompían la
+            # compatibilidad en lectores móviles. Si hay cualquier duda, se mantiene
+            # una imagen por XHTML.
+            def _can_compact_front_visual(page_index: int) -> bool:
+                if page_index in excluded_pages or page_index in consumed_full_pages:
+                    return False
+                if cover_page_idx is not None and page_index == cover_page_idx:
+                    return False
+                if page_index not in full_page_img_map:
+                    return False
+                mapped_ch = page_to_chapter[page_index] if page_index < len(page_to_chapter) else -1
+                if mapped_ch >= 0:
+                    return False
+                imgs = full_page_img_map.get(page_index, [])
+                if len(imgs) != 1:
+                    return False
+                img = imgs[0]
+                width = int(img.get("width") or 0)
+                height = int(img.get("height") or 0)
+                if width <= 0 or height <= 0:
+                    return False
+                ratio = max(width, height) / max(1, min(width, height))
+                # No compactar imágenes extremadamente altas/verticales ni muy grandes.
+                if ratio > 1.9:
+                    return False
+                if width * height > 3_000_000:
+                    return False
+                return True
+
+            if _can_compact_front_visual(pg_idx) and _can_compact_front_visual(pg_idx + 1):
+                spine_items.append({
+                    "type": "img_sequence",
+                    "images": [full_page_img_map[pg_idx][0], full_page_img_map[pg_idx + 1][0]],
+                })
+                pg_idx += 2
                 continue
+
+            for fimg in full_page_img_map[pg_idx]:
+                spine_items.append({"type": "img_page", "image": fimg})
+            pg_idx += 1
+            continue
 
         pg_idx += 1
 
@@ -2152,9 +2341,9 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
     else:
         print("  [EPUB] Validación de fragmentos: sin solapamientos sospechosos")
 
-    sequence_count = sum(1 for s in spine_items if s["type"] == "img_sequence")
+    sequence_count = sum(1 for s in spine_items if s["type"] in {"img_page", "img_sequence"})
     inline_img_count = sum(len(ch.get("inline_images", [])) for ch in chapters)
-    print(f"  [EPUB] Imágenes: {sequence_count} secuencia(s) visual(es), {inline_img_count} integradas en texto")
+    print(f"  [EPUB] Imágenes: {sequence_count} bloque(s) visual(es), {inline_img_count} integradas en texto")
 
     book_uuid = str(uuid.uuid4())
 
@@ -2202,14 +2391,34 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
         chapter_nav_written: set[int] = set()
 
         for item in spine_items:
-            if item["type"] == "img_sequence":
+            if item["type"] == "img_page":
                 visual_counter += 1
-                ip_filename = f"img_seq_{visual_counter:03d}.xhtml"
-                ip_id = f"imgseq{visual_counter:03d}"
+                ip_filename = f"img_{visual_counter:03d}.xhtml"
+                ip_id = f"imgpage{visual_counter:03d}"
+                img = item["image"]
+                title = img.get("caption") or f"Ilustración {visual_counter}"
+                caption_html = f'\n<p class="centrado"><i>{escape_xml(img.get("caption", ""))}</i></p>' if img.get("caption") else ""
+                zf.writestr(
+                    f"OEBPS/Text/{ip_filename}",
+                    XHTML_IMAGE_PAGE_TEMPLATE.format(
+                        lang=lang,
+                        title=escape_xml(title),
+                        alt="ilustración",
+                        imgname=img["name"],
+                        caption_html=caption_html,
+                    ),
+                )
+                manifest_items.append({"id": ip_id, "href": f"Text/{ip_filename}",
+                                       "media_type": "application/xhtml+xml"})
+                spine_idrefs.append(ip_id)
+            elif item["type"] == "img_sequence":
+                visual_counter += 1
+                ip_filename = f"img_{visual_counter:03d}.xhtml"
+                ip_id = f"imgpage{visual_counter:03d}"
                 title = f"Ilustraciones {visual_counter}"
                 zf.writestr(
                     f"OEBPS/Text/{ip_filename}",
-                    build_image_sequence_xhtml(item["images"], lang, title),
+                    build_image_sequence_xhtml(item["images"], lang=lang, title=escape_xml(title)),
                 )
                 manifest_items.append({"id": ip_id, "href": f"Text/{ip_filename}",
                                        "media_type": "application/xhtml+xml"})
