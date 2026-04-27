@@ -463,7 +463,7 @@ HTML = r"""<!DOCTYPE html>
 
 <header>
   <h1>pdf<em>2</em>epub</h1>
-  <span>v2 · Perfil Apotecaria</span>
+  <span>v2 · Perfil CoTE</span>
 </header>
 
 <main>
