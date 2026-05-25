@@ -11,21 +11,12 @@ Dependencias: pypdf pdfminer.six PyMuPDF pytesseract pillow
 """
 
 import argparse
-import io
-import math
 import json
-import hashlib
 import os
 import re
-import shutil
 import sys
-import tempfile
 import textwrap
-import uuid
-import zipfile
-from collections import Counter
 from pathlib import Path
-import pytesseract
 
 from converter.pdf_extract import (
     DEFAULT_OCR_DPI,
