@@ -11,233 +11,119 @@ Dependencias: pypdf pdfminer.six PyMuPDF pytesseract pillow
 """
 
 import argparse
-import io
-import math
 import json
-import hashlib
 import os
 import re
-import shutil
 import sys
-import tempfile
 import textwrap
 import uuid
 import zipfile
 from collections import Counter
 from pathlib import Path
-import pytesseract
 
+from converter.pdf_extract import (
+    DEFAULT_OCR_DPI,
+    DEFAULT_OCR_GARBAGE_THRESHOLD,
+    DEFAULT_OCR_LANG,
+    DEFAULT_OCR_MIN_TEXT_CHARS,
+    DEFAULT_OCR_MODE,
+    _build_image_record,
+    _extract_images_with_pymupdf,
+    _extract_images_with_pypdf,
+    _is_image_only_page,
+    _ocr_png_bytes,
+    _render_page_to_png_bytes,
+    _should_ocr_page,
+    apply_ocr_to_pages,
+    configure_tesseract,
+    extract_pdf_content,
+    extract_pdf_text,
+    get_base_dir,
+    get_tesseract_cmd,
+)
+from converter.text_utils import (
+    _clean_page_number_only,
+    _estimate_garbage_score,
+    _looks_like_visual_separator_text,
+    _normalize_heading_text,
+    clean_text,
+    clean_text_per_page,
+    is_structural_heading_line,
+    looks_like_section_subtitle,
+)
+from converter.image_filters import (
+    _encode_image_for_epub,
+    _filter_decorative_images,
+    _format_image_bbox_for_log,
+    _image_position_bucket,
+    _image_visual_hash_from_pil,
+    _log_discarded_images,
+    _looks_like_decorative_motif_image,
+    _looks_like_image_artifact,
+)
+
+from converter.chapters import (
+    CHAPTER_PATTERNS,
+    SPECIAL_SECTION_PATTERNS,
+    TOC_KEYWORDS,
+    _ROMAN_VALUES,
+    _add_toc_entry,
+    _build_sequential_page_para_ranges,
+    _build_toc_forced_headings,
+    _chapter_label_key,
+    _collect_auxiliary_pages,
+    _consume_forced_toc_heading,
+    _detect_page_heading,
+    _find_first_body_page,
+    _format_special_heading,
+    _fragment_first_text,
+    _fragment_image_names,
+    _guess_toc_page_offset,
+    _heading_identity_key,
+    _is_probable_toc_page,
+    _is_toc_entry_start_line,
+    _line_has_trailing_page_number,
+    _looks_like_short_heading,
+    _normalize_spine_fragments,
+    _parse_toc_entries_from_pages,
+    _parse_toc_entry,
+    _roman_to_int,
+    _split_possible_toc_entries,
+    _toc_entry_score,
+    _validate_spine_fragments,
+    detect_chapters,
+)
+
+from converter.epub_writer import (
+    CSS_PROFILE,
+    XHTML_CHAPTER_TEMPLATE,
+    XHTML_COVER_TEMPLATE,
+    XHTML_IMAGE_PAGE_TEMPLATE,
+    XHTML_IMAGE_SEQUENCE_TEMPLATE,
+    _find_neighbor_text_page,
+    _image_bytes_to_jpeg_bytes,
+    _path_to_jpeg_bytes,
+    _pick_auto_cover_image,
+    apply_inline_styles,
+    build_container_xml,
+    build_cover_xhtml,
+    build_image_page_xhtml,
+    build_image_sequence_xhtml,
+    build_ncx,
+    build_opf,
+    chapter_fragment_to_xhtml,
+    chapter_to_xhtml,
+    create_epub,
+    escape_xml,
+    inline_image_html,
+    para_to_html,
+    resolve_cover_image,
+)
 
 # ─────────────────────────────────────────────
 #  PERFIL DE FORMATO (basado en análisis EPUB)
 # ─────────────────────────────────────────────
 
-CSS_PROFILE = """\
-/* === RESET === */
-blockquote, div, h1, h2, h3, hr, p, img {
-    font-size: 1em;
-    font-style: inherit;
-    font-weight: inherit;
-    line-height: inherit;
-    margin: 0;
-    padding: 0;
-    text-indent: 0;
-}
-a, b, i, ins, del, big, small, span, sub, sup {
-    color: inherit;
-    font-size: inherit;
-    font-style: inherit;
-    font-weight: inherit;
-    text-decoration: none;
-    vertical-align: baseline;
-}
-
-/* === BODY === */
-body {
-    border: 0;
-    font-size: 1em;
-    orphans: 2;
-    padding: 0;
-    widows: 2;
-    font-style: normal;
-    font-weight: normal;
-}
-
-/* === PÁRRAFOS === */
-p {
-    display: block;
-    margin: 0;
-    padding: 0;
-    text-align: justify;
-    text-indent: 1.6em;
-    line-height: 1.6em;
-    orphans: 1;
-    widows: 2;
-}
-a { text-decoration: none; color: inherit; -webkit-text-fill-color: inherit; }
-
-/* === SIN SANGRÍA (primer párrafo del capítulo) === */
-.asangre, .asangre p { text-indent: 0; }
-
-/* === ENCABEZADOS === */
-h1, h2, h3, h4, h5, h6 {
-    font-size: 1.2em;
-    font-weight: bold;
-    margin-top: 1em;
-    margin-bottom: 1em;
-    text-align: center;
-    page-break-inside: avoid;
-    break-inside: avoid;
-    page-break-after: avoid;
-    break-after: avoid;
-}
-h1 { font-size: 1.6em; margin-top: 0em; }
-h1.titulo  { margin-top: 1.5em; margin-bottom: 0; }
-h2.subtitulo { margin-top: 0.5em; margin-bottom: 0; }
-h1.chapter-title { margin-top: 1.8em; margin-bottom: 0.4em; text-align: center; font-weight: bold; }
-h2.chapter-subtitle { margin-top: 0.2em; margin-bottom: 1.4em; text-align: center; font-size: 1.15em; font-weight: bold; }
-h3.part-title { margin-top: 1.4em; margin-bottom: 0.8em; text-align: center; font-size: 1.1em; font-weight: bold; }
-
-/* === ESTILOS EN LÍNEA === */
-i { font-style: italic; }
-b { font-weight: bold; }
-ins { text-decoration: underline; }
-del { text-decoration: line-through; }
-big { font-size: 1.2em; }
-small { font-size: 0.8em; }
-
-/* === NOTAS === */
-.nota { padding-top: 10%; page-break-before: always; }
-.nota p { text-indent: 0; }
-
-/* === IMÁGENES === */
-img {
-    display: block;
-    max-width: 100%;
-    width: auto;
-    height: auto;
-    margin: 0 auto;
-    page-break-inside: avoid;
-    break-inside: avoid;
-    border: 0;
-}
-div.dimg {
-    width: auto;
-    height: auto;
-    max-width: 100%;
-    margin: 1em auto;
-    line-height: 0;
-    text-align: center;
-    page-break-inside: avoid;
-    break-inside: avoid;
-}
-div.dimg.fullblock img {
-    max-width: 100%;
-    height: auto;
-}
-div.pagina  { width: 100%; height: auto; text-align: center; }
-div.seguida { width: 100%; height: auto; }
-div.galeria { width: 100%; height: auto; text-align: center; }
-div.galeria .dimg { margin-top: 0.8em; margin-bottom: 0.8em; }
-
-/* === ALINEACIÓN === */
-.centrado,  .centrado p  { text-align: center; text-indent: 0; }
-.izquierda, .izquierda p { text-align: left;   text-indent: 0; }
-.derecha,   .derecha p   { text-align: right;  text-indent: 0; }
-
-/* === SALTOS DE ESPACIO === */
-.salto1 { margin-top: 1.5em; }
-.salto2 { margin-top: 2em; }
-.salto3 { margin-top: 2.5em; }
-
-/* === CUBIERTA === */
-.cubierta {
-    margin: 0; padding: 0; border: 0;
-    font-size: 0; text-align: center; text-indent: 0;
-    page-break-before: always; page-break-after: always;
-}
-/* === OCULTO === */
-.oculto { display: none; visibility: hidden; }
-"""
-
-XHTML_CHAPTER_TEMPLATE = """\
-<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
-  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{lang}">
-<head>
-  <title>{title}</title>
-  <link href="../Styles/style.css" rel="stylesheet" type="text/css"/>
-</head>
-
-<body>
-{body}
-</body>
-</html>
-"""
-
-XHTML_COVER_TEMPLATE = """\
-<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
-  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{lang}">
-<head>
-  <title>Portada</title>
-  <link href="../Styles/style.css" rel="stylesheet" type="text/css"/>
-</head>
-
-<body>
-<div class="cubierta">
-  <img alt="portada" src="../Images/cover.jpg"/>
-</div>
-</body>
-</html>
-"""
-
-XHTML_IMAGE_PAGE_TEMPLATE = """\
-<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
-  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{lang}">
-<head>
-  <title>{title}</title>
-  <link href="../Styles/style.css" rel="stylesheet" type="text/css"/>
-</head>
-
-<body>
-<div class="pagina">
-  <div class="dimg fullblock">
-    <img alt="{alt}" src="../Images/{imgname}"/>
-  </div>{caption_html}
-</div>
-</body>
-</html>
-"""
-
-XHTML_IMAGE_SEQUENCE_TEMPLATE = """\
-<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
-  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{lang}">
-<head>
-  <title>{title}</title>
-  <link href="../Styles/style.css" rel="stylesheet" type="text/css"/>
-</head>
-
-<body>
-<div class="galeria">
-{body}
-</div>
-</body>
-</html>
-"""
-
-
-# ─────────────────────────────────────────────
 #  EXTRACCIÓN DE TEXTO E IMÁGENES DEL PDF
 # ─────────────────────────────────────────────
 
@@ -1399,356 +1285,12 @@ def extract_pdf_text(pdf_path: str) -> list[str]:
 #  LIMPIEZA DE TEXTO
 # ─────────────────────────────────────────────
 
-# Patrones de encabezados/pies repetidos (se detectan dinámicamente)
-HEADER_FOOTER_MIN_REPEAT = 4  # aparece en al menos N páginas = candidato a header/footer
-VARIABLE_PAGE_LINE_RE = re.compile(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9 .:'’_\-]{3,80}\s*\|\s*\d{1,4}$")
-STRUCTURAL_HEADING_RE = re.compile(
-    r'^[\-—–―|\s]*'
-    r'(?:cap[ií]tulo(?:\s+(?:\d+|extra|especial))?|chapter(?:\s+(?:\d+|extra|special))?|'
-    r'parte(?:\s+\d+)?|pr[oó]logo|prologue|ep[ií]logo|afterword|short\s+story|'
-    r'palabras del autor|agradecimientos?|acknowledgements?)\b',
-    re.IGNORECASE,
-)
 
 
-def is_structural_heading_line(line: str) -> bool:
-    s = _normalize_heading_text(line)
-    return bool(s and STRUCTURAL_HEADING_RE.match(s))
 
 
-def looks_like_section_subtitle(line: str) -> bool:
-    s = _normalize_heading_text(line)
-    if not s or is_structural_heading_line(s):
-        return False
-    if len(s) > 120 or len(s.split()) > 14:
-        return False
-    if re.search(r'\.{2,}\s*\d{1,4}$', s):
-        return False
-    if '|' in s and re.search(r'\d{1,4}$', s):
-        return False
-    if re.fullmatch(r'\d{1,4}', s):
-        return False
-    if re.match(r'^(?:cap[ií]tulo|chapter|parte|pr[oó]logo|ep[ií]logo|afterword|short\s+story)\b', s, re.IGNORECASE):
-        return False
-    words = [w for w in re.split(r'\s+', s) if w]
-    titled = sum(1 for w in words if re.match(r'^[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]+', w))
-    return titled >= max(1, len(words) // 2)
 
 
-def normalize_header_footer_candidate(line: str) -> str:
-    """Normaliza líneas candidatas a header/footer con número de página variable."""
-    s = re.sub(r'\s+', ' ', (line or '').strip())
-    if not s:
-        return ''
-    if is_structural_heading_line(s):
-        return ''
-
-    if re.fullmatch(r'[\-–—\s]*\d{1,4}[\-–—\s]*', s):
-        return '<PAGE_NUM>'
-
-    s = re.sub(r'\b(P[áa]g(?:ina)?\.?\s*)\d{1,4}\b', r'\1<PAGE_NUM>', s, flags=re.IGNORECASE)
-
-    if VARIABLE_PAGE_LINE_RE.fullmatch(s):
-        s = re.sub(r'\d{1,4}\s*$', '<PAGE_NUM>', s)
-
-    if re.fullmatch(r'[\-–—\s]*<PAGE_NUM>[\-–—\s]*', s):
-        return '<PAGE_NUM>'
-
-    s = re.sub(r'(?<!\w)\d{1,4}(?!\w)', '<PAGE_NUM>', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-
-    if is_structural_heading_line(s):
-        return ''
-    return s
-def detect_repeated_lines(pages: list[str]) -> tuple[set[str], set[str]]:
-    """Detecta líneas repetidas exactas y líneas repetidas tras normalización."""
-    from collections import Counter
-
-    exact_count: Counter = Counter()
-    normalized_count: Counter = Counter()
-
-    for page_text in pages:
-        lines = page_text.strip().splitlines()
-        candidates = lines[:3] + lines[-3:] if len(lines) >= 6 else lines
-        seen_exact: set[str] = set()
-        seen_normalized: set[str] = set()
-        for line in candidates:
-            stripped = re.sub(r'\s+', ' ', line.strip())
-            if not stripped or len(stripped) <= 2:
-                continue
-            if is_structural_heading_line(stripped):
-                continue
-            if stripped not in seen_exact:
-                exact_count[stripped] += 1
-                seen_exact.add(stripped)
-            normalized = normalize_header_footer_candidate(stripped)
-            if normalized and normalized not in seen_normalized:
-                normalized_count[normalized] += 1
-                seen_normalized.add(normalized)
-
-    repeated_exact = {line for line, count in exact_count.items() if count >= HEADER_FOOTER_MIN_REPEAT}
-    repeated_normalized = {line for line, count in normalized_count.items() if count >= HEADER_FOOTER_MIN_REPEAT}
-    return repeated_exact, repeated_normalized
-
-
-def clean_text(raw_pages: list[str], config: dict) -> str:
-    """
-    Limpieza del texto ya extraído. Devuelve un único string con párrafos
-    separados por doble newline.
-    NOTA: Para preservar info de página usa clean_text_per_page().
-    """
-    cleaned_pages = clean_text_per_page(raw_pages, config)
-    # Unir todas las páginas en un único string para detect_chapters
-    all_paragraphs: list[str] = []
-    for page_paras in cleaned_pages:
-        all_paragraphs.extend(page_paras)
-    return "\n\n".join(all_paragraphs)
-
-
-def clean_text_per_page(raw_pages: list[str], config: dict) -> list[list[str]]:
-    """
-    Igual que clean_text pero devuelve una lista de listas:
-      result[page_idx] = [párrafo1, párrafo2, ...]
-
-    Esto preserva a qué página pertenece cada párrafo, lo que permite
-    construir un mapa página→capítulo exacto en create_epub.
-    """
-    repeated_lines, repeated_normalized = detect_repeated_lines(raw_pages)
-    if config.get("verbose"):
-        if repeated_lines:
-            print(f"  [Limpieza] Líneas repetidas residuales exactas ({len(repeated_lines)}):")
-            for l in list(sorted(repeated_lines))[:5]:
-                print(f"    - {repr(l)}")
-        if repeated_normalized:
-            print(f"  [Limpieza] Patrones repetidos normalizados ({len(repeated_normalized)}):")
-            for l in list(sorted(repeated_normalized))[:5]:
-                print(f"    - {repr(l)}")
-
-    HF_EXTRA_PATTERNS = [
-        re.compile(r'P[áa]gina\s+N[°º]?\s*\d+', re.IGNORECASE),
-        re.compile(r'\bpág(?:ina)?\s*\.?\s*\d+', re.IGNORECASE),
-        re.compile(r'^[\-–—]\s*\d+\s*[\-–—]$'),
-        VARIABLE_PAGE_LINE_RE,
-    ]
-
-    verbose_removed = 0
-    result: list[list[str]] = []
-    for page_idx, page_text in enumerate(raw_pages):
-        page_lines: list[str] = []
-        for line in page_text.splitlines():
-            stripped = re.sub(r'\s+', ' ', line.strip())
-            if not stripped:
-                page_lines.append("")
-                continue
-
-            normalized = normalize_header_footer_candidate(stripped)
-            should_remove = False
-            if stripped in repeated_lines:
-                should_remove = True
-            elif normalized and normalized in repeated_normalized:
-                should_remove = True
-            elif re.fullmatch(r'\d{1,4}', stripped):
-                should_remove = True
-            elif any(p.search(stripped) for p in HF_EXTRA_PATTERNS):
-                should_remove = True
-
-            # No eliminar headings narrativos legítimos.
-            if should_remove and is_structural_heading_line(stripped):
-                should_remove = False
-
-            if should_remove:
-                if config.get("verbose") and verbose_removed < 10:
-                    print(f"  [Limpieza] Header/footer residual eliminado p.{page_idx + 1}: {repr(stripped)}")
-                    verbose_removed += 1
-                continue
-            page_lines.append(stripped)
-        paragraphs = reconstruct_paragraphs(page_lines, config)
-        result.append(paragraphs)
-
-    return result
-
-def reconstruct_paragraphs(lines: list[str], config: dict) -> list[str]:
-    """
-    Reconstruye párrafos a partir de líneas sueltas.
-    Heurísticas:
-    - Línea vacía → salto de párrafo definitivo
-    - Línea estructural (Prólogo / Capítulo / Parte / etc.) → párrafo propio
-    - Línea de subtítulo tras heading estructural → párrafo propio
-    - Línea que termina con guión de silabeo → unir con la siguiente
-    - Línea que termina en punto/interrogación/exclamación → párrafo completo
-    """
-    paragraphs: list[str] = []
-    current: list[str] = []
-
-    END_PUNCTUATION = re.compile(r"[.!?»\"'—\u201d\u2019]$")
-    DIALOG_START = re.compile(r'^[—–\-"«\u201c\u2018]')
-    SENTENCE_START = re.compile(r'^[A-ZÁÉÍÓÚÜÑ"«\u201c\u2018—–]')
-    HYPHEN_END = re.compile(r'-$')
-
-    prev_nonempty = ""
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-
-        if line == "":
-            if current:
-                paragraphs.append(" ".join(current))
-                current = []
-            i += 1
-            continue
-
-        if is_structural_heading_line(line):
-            if current:
-                paragraphs.append(" ".join(current))
-                current = []
-            paragraphs.append(_normalize_heading_text(line))
-            prev_nonempty = _normalize_heading_text(line)
-            i += 1
-            continue
-
-        if prev_nonempty and is_structural_heading_line(prev_nonempty) and looks_like_section_subtitle(line):
-            if current:
-                paragraphs.append(" ".join(current))
-                current = []
-            paragraphs.append(_normalize_heading_text(line))
-            prev_nonempty = _normalize_heading_text(line)
-            i += 1
-            continue
-
-        if HYPHEN_END.search(line) and i + 1 < len(lines) and lines[i + 1].strip():
-            next_line = lines[i + 1].strip()
-            if next_line and next_line[0].islower():
-                current.append(line[:-1] + next_line)
-                prev_nonempty = next_line
-                i += 2
-                continue
-
-        current.append(line)
-        prev_nonempty = line
-
-        close_paragraph = False
-        if END_PUNCTUATION.search(line):
-            close_paragraph = True
-        elif i + 1 < len(lines) and lines[i + 1].strip():
-            next_line = lines[i + 1].strip()
-            if is_structural_heading_line(next_line):
-                close_paragraph = True
-            elif SENTENCE_START.match(next_line) or DIALOG_START.match(next_line):
-                close_paragraph = True
-
-        if close_paragraph:
-            paragraphs.append(" ".join(current))
-            current = []
-
-        i += 1
-
-    if current:
-        paragraphs.append(" ".join(current))
-
-    result = []
-    for p in paragraphs:
-        p = p.strip()
-        if p and len(p) > 1:
-            result.append(p)
-    return result
-
-# ─────────────────────────────────────────────
-#  DETECCIÓN DE CAPÍTULOS
-# ─────────────────────────────────────────────
-
-CHAPTER_PATTERNS = [
-    re.compile(
-        r'^[\-—–―|\s]*'
-        r'(?:CAPÍTULO|CAPITULO|Capítulo|Capitulo|CHAPTER|Chapter|CAP\.|Cap\.)\s*'
-        r'(\d+|[IVXLCDM]+|EXTRA|ESPECIAL)'
-        r'(?:\s*[:.\-–—|]\s*(.+))?'
-        r'[\-—–―|\s]*$',
-        re.IGNORECASE
-    ),
-    re.compile(
-        r'^[\-—–―|\s]*(?:PARTE|Parte|PART)\s*(\d+|[IVXLCDM]+)'
-        r'(?:\s*[:.\-–—|]\s*(.+))?[\-—–―|\s]*$',
-        re.IGNORECASE
-    ),
-    re.compile(r'^[\-—–―|\s]*(?:SHORT\s+STORY|Short\s+Story)[\-—–―|\s]*$', re.IGNORECASE),
-    re.compile(r'^(\d{1,3})[.\-–]\s+([A-ZÁÉÍÓÚ].{3,})$'),
-    re.compile(
-        r'^[\-—–―|\s]*(Prólogo|Prolog|Epílogo|Epilogo|Interludio|Interlúdio|Interludio|'
-        r'Prefacio|Presentación|Presentacion|Introducción|Introduccion|'
-        r'Palabras del autor|Afterword|Foreword|Omake|Extra|Agradecimiento|Agradecimientos|Acknowledgement|Acknowledgements)\b',
-        re.IGNORECASE
-    ),
-]
-
-SPECIAL_SECTION_PATTERNS = [
-    ("prologue", re.compile(r'^(?:prólogo|prologo|prefacio|foreword|introducción|introduccion)\b', re.IGNORECASE)),
-    ("epilogue", re.compile(r'^(?:epílogo|epilogo)\b', re.IGNORECASE)),
-    ("afterword", re.compile(r'^(?:afterword|palabras del autor)\b', re.IGNORECASE)),
-    ("acknowledgements", re.compile(r'^(?:agradecimiento|agradecimientos|acknowledgement|acknowledgements)\b', re.IGNORECASE)),
-    ("short_story", re.compile(r'^(?:short\s+story)\b', re.IGNORECASE)),
-    ("part", re.compile(r'^(?:parte)\s+(?:\d+|[ivxlcdm]+)\b', re.IGNORECASE)),
-    ("extra", re.compile(r'^(?:omake|extra)\b', re.IGNORECASE)),
-]
-
-TOC_KEYWORDS = (
-    "tabla de contenido", "tabla de contenidos", "contenido", "contenidos",
-    "table of contents", "contents", "índice", "indice", "toc"
-)
-
-
-def _normalize_heading_text(text: str) -> str:
-    text = (text or "").replace(" ", " ")
-    text = re.sub(r'\s+', ' ', text).strip()
-    text = re.sub(r'^[\-—–―|\s]+', '', text)
-    text = re.sub(r'[\-—–―|\s]+$', '', text)
-    return text.strip()
-
-
-def _toc_entry_score(text: str) -> int:
-    text = _normalize_heading_text(text)
-    lower = text.lower()
-    if not text:
-        return 0
-
-    score = 0
-    shortish = len(text) <= 140 and len(text.split()) <= 18
-    has_section_name = bool(re.search(r'(cap[ií]tulo|chapter|prólogo|prologo|ep[ií]logo|epilogo|afterword|palabras del autor|agradecimiento)', lower))
-    has_leaders = bool(re.search(r'\.{2,}\s*\d{1,4}$', text))
-    has_pipe = '|' in text
-    trailing_page = bool(re.search(r'\b\d{1,4}$', text))
-
-    if any(k in lower for k in TOC_KEYWORDS):
-        score += 4
-    if shortish and has_section_name:
-        score += 2
-    if shortish and has_leaders:
-        score += 3
-    if shortish and has_pipe and has_section_name:
-        score += 2
-    if shortish and trailing_page and (has_section_name or has_leaders or has_pipe):
-        score += 1
-    return score
-
-
-def _is_probable_toc_page(page_paragraphs: list[str]) -> bool:
-    if not page_paragraphs:
-        return False
-    joined = _normalize_heading_text(" ".join(page_paragraphs))
-    lower = joined.lower()
-    if any(k in lower for k in TOC_KEYWORDS):
-        return True
-    scores = [_toc_entry_score(p) for p in page_paragraphs]
-    strong = sum(1 for s in scores if s >= 3)
-    medium = sum(1 for s in scores if s >= 2)
-    chapter_mentions = len(re.findall(r'(cap[ií]tulo|chapter|pr[óo]logo|ep[ií]logo|afterword)', lower))
-    page_numbers = len(re.findall(r'\b\d{1,4}\b', lower))
-    leader_count = len(re.findall(r'\.{2,}', joined))
-    return (
-        strong >= 2
-        or (medium >= 3 and page_numbers >= 3)
-        or (chapter_mentions >= 3 and page_numbers >= 3)
-        or (chapter_mentions >= 3 and leader_count >= 2)
-    )
 
 
 _ROMAN_VALUES = {
@@ -2383,863 +1925,45 @@ def detect_dialog_system(chapters: list[dict]) -> str:
     return dominant
 
 
-def escape_xml(text: str) -> str:
-    """Escapa caracteres especiales para XML/HTML."""
-    text = text.replace("&", "&amp;")
-    text = text.replace("<", "&lt;")
-    text = text.replace(">", "&gt;")
-    return text
-
-
-def apply_inline_styles(text: str) -> str:
-    """
-    Aplica estilos en línea:
-    - **texto** → <b>texto</b>
-    - *texto* → <i>texto</i>  (pensamientos y énfasis)
-    - Cursiva directa (texto ya marcado con <i> queda)
-    """
-    # Primero negrita (para que ** se procese antes que *)
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    # Luego cursiva
-    text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
-    return text
-
-
-def para_to_html(para: str, first_in_chapter: bool = False) -> str:
-    """
-    Convierte un párrafo de texto plano a HTML.
-    - Maneja estilos en línea
-    - Aplica class="asangre" al primer párrafo
-    - Detecta pensamientos en cursiva (entre *asteriscos*)
-    """
-    para = escape_xml(para)
-    para = apply_inline_styles(para)
-
-    css_class = ' class="asangre"' if first_in_chapter else ""
-    return f'<p{css_class}>{para}</p>'
-
-
-def inline_image_html(imgname: str, caption: str = "", layout: str = "inline") -> str:
-    """Genera el HTML para una imagen dentro del flujo de un capítulo."""
-    cap_html = f'\n<p class="centrado"><i>{escape_xml(caption)}</i></p>' if caption else ""
-    extra_class = " fullblock" if layout == "fullblock" else ""
-    return (
-        f'<div class="dimg{extra_class}">\n'
-        f'  <img alt="ilustración" src="../Images/{imgname}"/>\n'
-        f'</div>{cap_html}'
-    )
 
 
 
-def chapter_to_xhtml(chapter: dict, lang: str = "es") -> str:
-    """Convierte un capítulo completo a XHTML."""
-    return chapter_fragment_to_xhtml(
-        chapter,
-        start_idx=0,
-        end_idx=len(chapter.get("paragraphs", [])),
-        lang=lang,
-        include_header=True,
-        first_text_para_global=True,
-    )
 
 
-def chapter_fragment_to_xhtml(chapter: dict, start_idx: int, end_idx: int,
-                              lang: str = "es", include_header: bool = True,
-                              first_text_para_global: bool = True,
-                              suppress_images: set[str] | None = None) -> str:
-    """
-    Convierte un fragmento de capítulo a XHTML para poder intercalar imágenes
-    de página completa exactamente donde aparecen en el PDF.
-    """
-    title = chapter["title"]
-    subtitle = chapter.get("subtitle", "").strip()
-    paragraphs = chapter.get("paragraphs", [])[start_idx:end_idx]
-    inline_images = chapter.get("inline_images", [])
 
-    body_parts = []
-    if include_header:
-        section_kind = chapter.get("section_kind", "chapter")
-        if section_kind == "part":
-            body_parts.append(f'<h3 class="part-title">{escape_xml(title)}</h3>')
-        else:
-            body_parts.append(f'<h1 class="chapter-title">{escape_xml(title)}</h1>')
-        if subtitle:
-            body_parts.append(f'<h2 class="chapter-subtitle">{escape_xml(subtitle)}</h2>')
 
-    suppress_images = suppress_images or set()
-    img_by_pos: dict[int, list] = {}
-    seen_img_names: set[str] = set()
-    for img in inline_images:
-        imgname = img.get("imgname", "")
-        if not imgname or imgname in seen_img_names or imgname in suppress_images:
-            continue
-        pos = img.get("after_para_idx", -1)
-        if pos < start_idx - 1 or pos >= end_idx:
-            continue
-        rebased = pos - start_idx
-        img_copy = dict(img)
-        img_copy["after_para_idx"] = rebased
-        img_by_pos.setdefault(rebased, []).append(img_copy)
-        seen_img_names.add(imgname)
 
-    for img in img_by_pos.get(-1, []):
-        body_parts.append(inline_image_html(img["imgname"], img.get("caption", ""), img.get("layout", "inline")))
 
-    first_text_para = first_text_para_global
-    for i, para in enumerate(paragraphs):
-        if para.strip():
-            body_parts.append(para_to_html(para, first_in_chapter=first_text_para))
-            first_text_para = False
-        for img in img_by_pos.get(i, []):
-            body_parts.append(inline_image_html(img["imgname"], img.get("caption", ""), img.get("layout", "inline")))
 
-    body_html = "\n".join(body_parts)
 
-    return XHTML_CHAPTER_TEMPLATE.format(
-        lang=lang,
-        title=f"{title}{': ' + subtitle if subtitle else ''}",
-        body=body_html,
-    )
 
 
 # ─────────────────────────────────────────────
 #  GENERACIÓN DEL EPUB
 # ─────────────────────────────────────────────
 
-def build_opf(meta: dict, manifest_items: list[dict], spine_idrefs: list[str], book_id: str) -> str:
-    """Genera el content.opf."""
 
-    manifest_xml = "\n    ".join(
-        f'<item id="{item["id"]}" href="{item["href"]}" media-type="{item["media_type"]}"/>'
-        for item in manifest_items
-    )
 
-    spine_xml = "\n    ".join(
-        f'<itemref idref="{idref}"/>' for idref in spine_idrefs
-    )
 
-    cover_item = next((i for i in manifest_items if i["id"] == "cover-image"), None)
-    cover_meta = f'\n    <meta name="cover" content="cover-image"/>' if cover_item else ""
 
-    return f"""<?xml version="1.0" encoding="utf-8"?>
-<package version="2.0" unique-identifier="BookId"
-         xmlns="http://www.idpf.org/2007/opf">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"
-            xmlns:opf="http://www.idpf.org/2007/opf">
-    <dc:title>{escape_xml(meta.get('title', 'Sin título'))}</dc:title>
-    <dc:creator>{escape_xml(meta.get('author', 'Desconocido'))}</dc:creator>
-    <dc:language>{meta.get('lang', 'es')}</dc:language>
-    <dc:publisher>{escape_xml(meta.get('publisher', ''))}</dc:publisher>
-    <dc:identifier id="BookId" opf:scheme="UUID">urn:uuid:{book_id}</dc:identifier>
-    <dc:date>{meta.get('date', '2026')}</dc:date>{cover_meta}
-  </metadata>
-  <manifest>
-    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
-    <item id="style" href="Styles/style.css" media-type="text/css"/>
-    {manifest_xml}
-  </manifest>
-  <spine toc="ncx">
-    {spine_xml}
-  </spine>
-  <guide>
-    <reference type="cover" title="Portada" href="Text/Portada.xhtml"/>
-    <reference type="text" title="Inicio" href="Text/001.xhtml"/>
-  </guide>
-</package>
-"""
 
 
-def build_ncx(meta: dict, nav_points: list[dict], book_id: str) -> str:
-    """Genera el toc.ncx."""
-    nav_xml_parts = []
-    for i, point in enumerate(nav_points, 1):
-        nav_xml_parts.append(f"""    <navPoint id="navPoint-{i}" playOrder="{i}">
-      <navLabel><text>{escape_xml(point['label'])}</text></navLabel>
-      <content src="{point['src']}"/>
-    </navPoint>""")
 
-    nav_xml = "\n".join(nav_xml_parts)
 
-    return f"""<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN"
-  "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
-<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="{meta.get('lang','es')}">
-  <head>
-    <meta name="dtb:uid" content="urn:uuid:{book_id}"/>
-    <meta name="dtb:depth" content="1"/>
-    <meta name="dtb:totalPageCount" content="0"/>
-    <meta name="dtb:maxPageNumber" content="0"/>
-  </head>
-  <docTitle><text>{escape_xml(meta.get('title',''))}</text></docTitle>
-  <navMap>
-{nav_xml}
-  </navMap>
-</ncx>
-"""
 
 
-def build_container_xml() -> str:
-    return """<?xml version="1.0" encoding="utf-8"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-  <rootfiles>
-    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
-  </rootfiles>
-</container>
-"""
 
 
-def build_cover_xhtml(lang: str = "es") -> str:
-    return XHTML_COVER_TEMPLATE.format(lang=lang)
 
 
-def build_image_page_xhtml(img: dict, lang: str, title: str) -> str:
-    """Genera el XHTML para una página completa de imagen."""
-    caption_html = ""
-    if img.get("caption"):
-        caption_html = f'\n<p class="centrado"><i>{escape_xml(img["caption"])}</i></p>'
-    return XHTML_IMAGE_PAGE_TEMPLATE.format(
-        lang=lang,
-        title=title,
-        alt="ilustración",
-        imgname=img["name"],
-        caption_html=caption_html,
-    )
 
 
-def _image_bytes_to_jpeg_bytes(image_bytes: bytes) -> bytes:
-    from PIL import Image
 
-    img = Image.open(io.BytesIO(image_bytes))
-    img = _flatten_image_for_mobile_compat(img)
 
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=92, progressive=False, optimize=False, subsampling=0)
-    return buf.getvalue()
 
 
-def _path_to_jpeg_bytes(image_path: str) -> bytes:
-    with open(image_path, "rb") as f:
-        return _image_bytes_to_jpeg_bytes(f.read())
+# Helpers de fragmentos/spine extraídos a converter.chapters.
 
-
-def _pick_auto_cover_image(images: list[dict]) -> dict | None:
-    if not images:
-        return None
-
-    useful: list[dict] = []
-    for img in images:
-        width = int(img.get("width") or 0)
-        height = int(img.get("height") or 0)
-        area = width * height
-        if img.get("is_full_page") or area >= 160000 or len(img.get("data", b"")) >= 12000:
-            useful.append(img)
-
-    candidates = useful or images
-
-    def sort_key(img: dict):
-        page_idx = int(img.get("page_idx", 10**6))
-        is_page_one = 0 if page_idx == 0 else 1
-        full_page_priority = 0 if img.get("is_full_page") else 1
-        later_page_penalty = page_idx
-        size_penalty = -int((img.get("width") or 0) * (img.get("height") or 0))
-        return (is_page_one, full_page_priority, later_page_penalty, size_penalty)
-
-    candidates = sorted(candidates, key=sort_key)
-    return candidates[0] if candidates else None
-
-
-def resolve_cover_image(cover_image_path: str | None = None,
-                        images: list[dict] | None = None) -> tuple[bytes | None, str, int | None]:
-    if cover_image_path and os.path.exists(cover_image_path):
-        return _path_to_jpeg_bytes(cover_image_path), "manual", None
-
-    auto_cover = _pick_auto_cover_image(images or [])
-    if auto_cover is not None:
-        return (
-            _image_bytes_to_jpeg_bytes(auto_cover["data"]),
-            f"auto:página {int(auto_cover.get('page_idx', 0)) + 1}",
-            int(auto_cover.get('page_idx', 0)),
-        )
-
-    return None, "none", None
-
-
-
-
-def _build_sequential_page_para_ranges(chapters: list[dict], pages_paragraphs: list[list[str]], page_to_chapter: list[int]) -> dict[tuple[int, int], tuple[int, int]]:
-    """Mapea páginas a rangos de párrafos secuenciales dentro de cada capítulo.
-    Evita que párrafos repetidos se asignen siempre a su primera aparición."""
-    n_pages = len(pages_paragraphs)
-    chapter_pages: dict[int, list[int]] = {}
-    for pg_idx in range(n_pages):
-        ch_idx = page_to_chapter[pg_idx] if pg_idx < len(page_to_chapter) else -1
-        if ch_idx >= 0:
-            chapter_pages.setdefault(ch_idx, []).append(pg_idx)
-
-    ranges: dict[tuple[int, int], tuple[int, int]] = {}
-    for ch_idx, page_indices in chapter_pages.items():
-        chapter_paras = [p.strip() for p in chapters[ch_idx].get("paragraphs", []) if p and p.strip()]
-        if not chapter_paras:
-            continue
-
-        positions_by_key: dict[str, list[int]] = {}
-        for pos, para in enumerate(chapter_paras):
-            positions_by_key.setdefault(para, []).append(pos)
-
-        cursor = 0
-        for pg_idx in page_indices:
-            visible = [p.strip() for p in pages_paragraphs[pg_idx] if p and p.strip()]
-            if not visible:
-                continue
-
-            matched_positions: list[int] = []
-            local_cursor = cursor
-            for para in visible:
-                candidates = positions_by_key.get(para)
-                if not candidates:
-                    continue
-                chosen = next((pos for pos in candidates if pos >= local_cursor), None)
-                if chosen is None:
-                    continue
-                matched_positions.append(chosen)
-                local_cursor = chosen + 1
-
-            if matched_positions:
-                start = matched_positions[0]
-                end = matched_positions[-1] + 1
-                ranges[(ch_idx, pg_idx)] = (start, end)
-                cursor = max(cursor, end)
-
-    return ranges
-
-
-def _fragment_first_text(chapters: list[dict], item: dict) -> str:
-    if item.get("type") != "chapter_fragment":
-        return ""
-    ch_idx = item.get("ch_idx", -1)
-    if ch_idx < 0 or ch_idx >= len(chapters):
-        return ""
-    paras = chapters[ch_idx].get("paragraphs", [])
-    start = max(0, int(item.get("start_idx", 0)))
-    end = min(len(paras), int(item.get("end_idx", 0)))
-    for para in paras[start:end]:
-        key = (para or "").strip()
-        if key:
-            return key
-    return ""
-
-
-def _fragment_image_names(chapters: list[dict], item: dict) -> set[str]:
-    if item.get("type") != "chapter_fragment":
-        return set()
-    ch_idx = item.get("ch_idx", -1)
-    if ch_idx < 0 or ch_idx >= len(chapters):
-        return set()
-    start_idx = int(item.get("start_idx", 0))
-    end_idx = int(item.get("end_idx", 0))
-    names: set[str] = set()
-    for img in chapters[ch_idx].get("inline_images", []):
-        name = img.get("imgname", "")
-        if not name:
-            continue
-        pos = int(img.get("after_para_idx", -1))
-        if start_idx - 1 <= pos < end_idx:
-            names.add(name)
-    return names
-
-
-def _normalize_spine_fragments(spine_items: list[dict], chapters: list[dict]) -> tuple[list[dict], list[str]]:
-    normalized: list[dict] = []
-    issues: list[str] = []
-    last_end_by_chapter: dict[int, int] = {}
-    prev_fragment: dict | None = None
-
-    for item in spine_items:
-        if item.get("type") != "chapter_fragment":
-            normalized.append(item)
-            prev_fragment = None
-            continue
-
-        cur = dict(item)
-        ch_idx = int(cur.get("ch_idx", -1))
-        start = int(cur.get("start_idx", 0))
-        end = int(cur.get("end_idx", 0))
-
-        last_end = last_end_by_chapter.get(ch_idx)
-        if last_end is not None and start < last_end:
-            issues.append(f"overlap_trim ch={ch_idx} {start}->{end} trimmed_to {last_end}->{end}")
-            start = last_end
-            cur["start_idx"] = start
-        if end <= start:
-            issues.append(f"empty_drop ch={ch_idx} {start}->{end}")
-            continue
-
-        if prev_fragment and prev_fragment.get("type") == "chapter_fragment" and prev_fragment.get("ch_idx") == ch_idx:
-            prev_first = _fragment_first_text(chapters, prev_fragment)
-            cur_first = _fragment_first_text(chapters, cur)
-            if prev_first and cur_first and prev_first == cur_first:
-                prev_end = int(prev_fragment.get("end_idx", 0))
-                if start < prev_end:
-                    start = prev_end
-                    cur["start_idx"] = start
-                    issues.append(f"same_start_trim ch={ch_idx} -> {start}->{end}")
-            shared_images = _fragment_image_names(chapters, prev_fragment) & _fragment_image_names(chapters, cur)
-            if shared_images:
-                suppress = set(cur.get("suppress_images", []))
-                suppress.update(shared_images)
-                cur["suppress_images"] = sorted(suppress)
-                issues.append(f"shared_images_suppressed ch={ch_idx} imgs={','.join(sorted(shared_images))}")
-            if int(cur.get("end_idx", 0)) <= int(cur.get("start_idx", 0)):
-                issues.append(f"post_check_drop ch={ch_idx} {cur.get('start_idx')}->{cur.get('end_idx')}")
-                continue
-
-        normalized.append(cur)
-        last_end_by_chapter[ch_idx] = int(cur.get("end_idx", 0))
-        prev_fragment = cur
-
-    return normalized, issues
-
-
-def _validate_spine_fragments(spine_items: list[dict], chapters: list[dict]) -> list[str]:
-    issues: list[str] = []
-    prev_fragment: dict | None = None
-    for item in spine_items:
-        if item.get("type") != "chapter_fragment":
-            prev_fragment = None
-            continue
-        if prev_fragment and prev_fragment.get("type") == "chapter_fragment" and prev_fragment.get("ch_idx") == item.get("ch_idx"):
-            if int(item.get("start_idx", 0)) < int(prev_fragment.get("end_idx", 0)):
-                issues.append(f"overlap ch={item.get('ch_idx')} {prev_fragment.get('start_idx')}->{prev_fragment.get('end_idx')} with {item.get('start_idx')}->{item.get('end_idx')}")
-            prev_first = _fragment_first_text(chapters, prev_fragment)
-            cur_first = _fragment_first_text(chapters, item)
-            if prev_first and cur_first and prev_first == cur_first:
-                issues.append(f"same_start_text ch={item.get('ch_idx')} text={prev_first[:80]}")
-            shared_images = _fragment_image_names(chapters, prev_fragment) & _fragment_image_names(chapters, item)
-            shared_images -= set(item.get("suppress_images", []))
-            if shared_images:
-                issues.append(f"shared_images ch={item.get('ch_idx')} imgs={','.join(sorted(shared_images))}")
-        prev_fragment = item
-    return issues
-
-def create_epub(chapters: list[dict], meta: dict, output_path: str,
-                cover_image_path: str | None = None,
-                images: list[dict] | None = None,
-                raw_pages: list[str] | None = None,
-                pages_paragraphs: list[list[str]] | None = None,
-                page_to_chapter: list | None = None) -> None:
-    """
-    Genera el archivo EPUB final siguiendo el orden real de las páginas del PDF,
-    pero evitando desperdiciar espacio cuando hay ilustraciones o secuencias
-    visuales. Las imágenes decorativas repetidas ya se filtran antes, y aquí:
-      - las ilustraciones entre texto se integran dentro del flujo del capítulo
-      - las imágenes de páginas consecutivas sin texto se agrupan en una galería
-      - la portada automática no se duplica como página normal
-    """
-    lang = meta.get("lang", "es")
-    images = images or []
-    raw_pages = raw_pages or []
-    pages_paragraphs = pages_paragraphs or []
-    n_pages = len(raw_pages)
-
-    excluded_pages = set(meta.get('excluded_pages', []) or [])
-    full_page_img_map: dict[int, list] = {}
-    inline_imgs_by_page: dict[int, list] = {}
-    for img in images:
-        if img["is_full_page"]:
-            full_page_img_map.setdefault(img["page_idx"], []).append(img)
-        else:
-            inline_imgs_by_page.setdefault(img["page_idx"], []).append(img)
-
-    if page_to_chapter is None or len(page_to_chapter) != n_pages:
-        page_to_chapter = [0] * n_pages if chapters else []
-
-    cover_bytes, cover_source, cover_page_idx = resolve_cover_image(cover_image_path=cover_image_path, images=images)
-    has_cover_img = cover_bytes is not None
-
-    mapped = sum(1 for c in page_to_chapter if c >= 0)
-    print(f"  [EPUB] Mapa página→capítulo: {mapped}/{n_pages} páginas mapeadas")
-
-    for ch in chapters:
-        ch.setdefault("inline_images", [])
-
-    page_para_ranges = _build_sequential_page_para_ranges(chapters, pages_paragraphs, page_to_chapter)
-
-    # Imágenes inline normales: ancladas al final del rango textual de la página.
-    for pg_idx, page_imgs in inline_imgs_by_page.items():
-        ch_idx = page_to_chapter[pg_idx] if pg_idx < len(page_to_chapter) else -1
-        if ch_idx < 0 or ch_idx >= len(chapters):
-            continue
-        start_end = page_para_ranges.get((ch_idx, pg_idx))
-        if start_end:
-            _, end_idx = start_end
-            after_idx = end_idx - 1
-        else:
-            after_idx = -1
-        for iimg in page_imgs:
-            chapters[ch_idx]["inline_images"].append({
-                "after_para_idx": after_idx,
-                "imgname": iimg["name"],
-                "caption": iimg.get("caption", ""),
-                "layout": "inline",
-            })
-
-    # Imágenes de página completa dentro del cuerpo narrativo:
-    # si están entre páginas del mismo capítulo, las integramos en el XHTML del
-    # capítulo en vez de emitir una página EPUB aparte.
-    consumed_full_pages: set[int] = set()
-    for pg_idx, page_imgs in full_page_img_map.items():
-        if pg_idx in excluded_pages:
-            continue
-        if cover_page_idx is not None and pg_idx == cover_page_idx:
-            continue
-        ch_idx = page_to_chapter[pg_idx] if pg_idx < len(page_to_chapter) else -1
-        if ch_idx < 0 or ch_idx >= len(chapters):
-            continue
-
-        prev_info = _find_neighbor_text_page(page_para_ranges, ch_idx, pg_idx, -1, limit=2)
-        next_info = _find_neighbor_text_page(page_para_ranges, ch_idx, pg_idx, +1, limit=2)
-        if prev_info is None and next_info is None:
-            continue
-
-        if prev_info is not None:
-            _, (_, prev_end_idx) = prev_info
-            after_idx = prev_end_idx - 1
-        else:
-            after_idx = -1
-
-        for fimg in page_imgs:
-            chapters[ch_idx]["inline_images"].append({
-                "after_para_idx": after_idx,
-                "imgname": fimg["name"],
-                "caption": fimg.get("caption", ""),
-                "layout": "fullblock",
-            })
-        consumed_full_pages.add(pg_idx)
-
-    for ch in chapters:
-        ch["inline_images"].sort(key=lambda x: (x.get("after_para_idx", -1), x.get("imgname", "")))
-
-    spine_items: list[dict] = []
-    nav_points: list[dict] = [{"label": "Portada", "src": "Text/Portada.xhtml"}]
-    chapter_nav_added: set[int] = set()
-    current_segment: dict | None = None
-
-    def flush_segment():
-        nonlocal current_segment
-        if current_segment and current_segment["start_idx"] < current_segment["end_idx"]:
-            spine_items.append(dict(current_segment))
-        current_segment = None
-
-    pg_idx = 0
-    while pg_idx < n_pages:
-        if pg_idx in excluded_pages:
-            pg_idx += 1
-            continue
-        if cover_page_idx is not None and pg_idx == cover_page_idx:
-            pg_idx += 1
-            continue
-        if pg_idx in consumed_full_pages:
-            pg_idx += 1
-            continue
-
-        ch_idx = page_to_chapter[pg_idx] if pg_idx < len(page_to_chapter) else -1
-        page_range = page_para_ranges.get((ch_idx, pg_idx)) if ch_idx >= 0 else None
-
-        if page_range:
-            start_idx, end_idx = page_range
-            if current_segment is None:
-                current_segment = {
-                    "type": "chapter_fragment",
-                    "ch_idx": ch_idx,
-                    "start_idx": start_idx,
-                    "end_idx": end_idx,
-                    "include_header": ch_idx not in chapter_nav_added,
-                }
-            elif current_segment["ch_idx"] == ch_idx and current_segment["end_idx"] == start_idx:
-                current_segment["end_idx"] = end_idx
-            else:
-                flush_segment()
-                current_segment = {
-                    "type": "chapter_fragment",
-                    "ch_idx": ch_idx,
-                    "start_idx": start_idx,
-                    "end_idx": end_idx,
-                    "include_header": ch_idx not in chapter_nav_added,
-                }
-            if ch_idx >= 0:
-                chapter_nav_added.add(ch_idx)
-            pg_idx += 1
-            continue
-
-        if pg_idx in full_page_img_map:
-            flush_segment()
-
-            # Intento conservador de compactación: para front matter puramente visual
-            # (sin mapeo a capítulo) permitimos agrupar COMO MÁXIMO dos páginas
-            # visuales consecutivas en un solo XHTML simple. Esto recupera parte de
-            # la compactación previa sin volver a las galerías largas que rompían la
-            # compatibilidad en lectores móviles. Si hay cualquier duda, se mantiene
-            # una imagen por XHTML.
-            def _can_compact_front_visual(page_index: int) -> bool:
-                if page_index in excluded_pages or page_index in consumed_full_pages:
-                    return False
-                if cover_page_idx is not None and page_index == cover_page_idx:
-                    return False
-                if page_index not in full_page_img_map:
-                    return False
-                mapped_ch = page_to_chapter[page_index] if page_index < len(page_to_chapter) else -1
-                if mapped_ch >= 0:
-                    return False
-                imgs = full_page_img_map.get(page_index, [])
-                if len(imgs) != 1:
-                    return False
-                img = imgs[0]
-                width = int(img.get("width") or 0)
-                height = int(img.get("height") or 0)
-                if width <= 0 or height <= 0:
-                    return False
-                ratio = max(width, height) / max(1, min(width, height))
-                # No compactar imágenes extremadamente altas/verticales ni muy grandes.
-                if ratio > 1.9:
-                    return False
-                if width * height > 3_000_000:
-                    return False
-                return True
-
-            if _can_compact_front_visual(pg_idx) and _can_compact_front_visual(pg_idx + 1):
-                spine_items.append({
-                    "type": "img_sequence",
-                    "images": [full_page_img_map[pg_idx][0], full_page_img_map[pg_idx + 1][0]],
-                })
-                pg_idx += 2
-                continue
-
-            for fimg in full_page_img_map[pg_idx]:
-                spine_items.append({"type": "img_page", "image": fimg})
-            pg_idx += 1
-            continue
-
-        pg_idx += 1
-
-    flush_segment()
-
-    emitted_covering: dict[int, tuple[int, int]] = {}
-    for item in spine_items:
-        if item["type"] != "chapter_fragment":
-            continue
-        ch_idx = item["ch_idx"]
-        start_idx = item["start_idx"]
-        end_idx = item["end_idx"]
-        prev = emitted_covering.get(ch_idx)
-        if prev is None:
-            emitted_covering[ch_idx] = (start_idx, end_idx)
-        else:
-            emitted_covering[ch_idx] = (min(prev[0], start_idx), max(prev[1], end_idx))
-
-    chapter_ranges: dict[int, list[tuple[int, int]]] = {}
-    for item in spine_items:
-        if item["type"] != "chapter_fragment":
-            continue
-        chapter_ranges.setdefault(item["ch_idx"], []).append((item["start_idx"], item["end_idx"]))
-
-    def _merged_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        cleaned = sorted((s, e) for s, e in ranges if e >= s)
-        if not cleaned:
-            return []
-        merged = [cleaned[0]]
-        for start, end in cleaned[1:]:
-            last_start, last_end = merged[-1]
-            if start <= last_end:
-                merged[-1] = (last_start, max(last_end, end))
-            else:
-                merged.append((start, end))
-        return merged
-
-    for ch_idx, ch in enumerate(chapters):
-        total = len(ch.get("paragraphs", []))
-        ranges = _merged_ranges(chapter_ranges.get(ch_idx, []))
-
-        if total == 0 and not ranges:
-            spine_items.append({
-                "type": "chapter_fragment",
-                "ch_idx": ch_idx,
-                "start_idx": 0,
-                "end_idx": 0,
-                "include_header": ch_idx not in chapter_nav_added,
-            })
-            continue
-
-        if not ranges:
-            spine_items.append({
-                "type": "chapter_fragment",
-                "ch_idx": ch_idx,
-                "start_idx": 0,
-                "end_idx": total,
-                "include_header": ch_idx not in chapter_nav_added,
-            })
-            continue
-
-        cursor = 0
-        for start, end in ranges:
-            if cursor < start:
-                spine_items.append({
-                    "type": "chapter_fragment",
-                    "ch_idx": ch_idx,
-                    "start_idx": cursor,
-                    "end_idx": start,
-                    "include_header": ch_idx not in chapter_nav_added and cursor == 0,
-                })
-                if cursor == 0:
-                    chapter_nav_added.add(ch_idx)
-            cursor = max(cursor, end)
-
-        if cursor < total:
-            spine_items.append({
-                "type": "chapter_fragment",
-                "ch_idx": ch_idx,
-                "start_idx": cursor,
-                "end_idx": total,
-                "include_header": ch_idx not in chapter_nav_added and cursor == 0,
-            })
-            if cursor == 0:
-                chapter_nav_added.add(ch_idx)
-
-    spine_items, normalization_issues = _normalize_spine_fragments(spine_items, chapters)
-    for issue in normalization_issues[:12]:
-        print(f"  [EPUB] Ajuste fragmentos: {issue}")
-    if len(normalization_issues) > 12:
-        print(f"  [EPUB] Ajuste fragmentos: ... y {len(normalization_issues)-12} más")
-
-    validation_issues = _validate_spine_fragments(spine_items, chapters)
-    if validation_issues:
-        print("  [EPUB] ⚠️ Validación de fragmentos detectó problemas residuales:")
-        for issue in validation_issues[:12]:
-            print(f"    - {issue}")
-        if len(validation_issues) > 12:
-            print(f"    ... y {len(validation_issues)-12} más")
-    else:
-        print("  [EPUB] Validación de fragmentos: sin solapamientos sospechosos")
-
-    sequence_count = sum(1 for s in spine_items if s["type"] in {"img_page", "img_sequence"})
-    inline_img_count = sum(len(ch.get("inline_images", [])) for ch in chapters)
-    print(f"  [EPUB] Imágenes: {sequence_count} bloque(s) visual(es), {inline_img_count} integradas en texto")
-
-    book_uuid = str(uuid.uuid4())
-
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(zipfile.ZipInfo("mimetype"), "application/epub+zip",
-                    compress_type=zipfile.ZIP_STORED)
-        zf.writestr("META-INF/container.xml", build_container_xml())
-        zf.writestr("OEBPS/Styles/style.css", CSS_PROFILE)
-
-        if has_cover_img:
-            print(f"  [EPUB] Portada: {cover_source}")
-            zf.writestr("OEBPS/Images/cover.jpg", cover_bytes)
-            zf.writestr("OEBPS/Text/Portada.xhtml", build_cover_xhtml(lang))
-        else:
-            print("  [EPUB] Portada: sin imagen, se usará portada tipográfica")
-            zf.writestr("OEBPS/Text/Portada.xhtml", XHTML_CHAPTER_TEMPLATE.format(
-                lang=lang, title="Portada",
-                body=(f'<h1 class="titulo">{escape_xml(meta.get("title",""))}</h1>\n'
-                      f'<h2 class="subtitulo">{escape_xml(meta.get("author",""))}</h2>'),
-            ))
-
-        for img in images:
-            zf.writestr(f"OEBPS/Images/{img['name']}", img["data"])
-
-        manifest_items: list[dict] = []
-        spine_idrefs: list[str] = []
-
-        manifest_items.append({"id": "Portada", "href": "Text/Portada.xhtml",
-                               "media_type": "application/xhtml+xml"})
-        spine_idrefs.append("Portada")
-
-        if has_cover_img:
-            manifest_items.append({"id": "cover-image", "href": "Images/cover.jpg",
-                                   "media_type": "image/jpeg"})
-
-        for img in images:
-            manifest_items.append({
-                "id": f"img-{img['name'].replace('.', '-')}",
-                "href": f"Images/{img['name']}",
-                "media_type": img["media_type"],
-            })
-
-        visual_counter = 0
-        text_counter = 0
-        chapter_nav_written: set[int] = set()
-
-        for item in spine_items:
-            if item["type"] == "img_page":
-                visual_counter += 1
-                ip_filename = f"img_{visual_counter:03d}.xhtml"
-                ip_id = f"imgpage{visual_counter:03d}"
-                img = item["image"]
-                title = img.get("caption") or f"Ilustración {visual_counter}"
-                caption_html = f'\n<p class="centrado"><i>{escape_xml(img.get("caption", ""))}</i></p>' if img.get("caption") else ""
-                zf.writestr(
-                    f"OEBPS/Text/{ip_filename}",
-                    XHTML_IMAGE_PAGE_TEMPLATE.format(
-                        lang=lang,
-                        title=escape_xml(title),
-                        alt="ilustración",
-                        imgname=img["name"],
-                        caption_html=caption_html,
-                    ),
-                )
-                manifest_items.append({"id": ip_id, "href": f"Text/{ip_filename}",
-                                       "media_type": "application/xhtml+xml"})
-                spine_idrefs.append(ip_id)
-            elif item["type"] == "img_sequence":
-                visual_counter += 1
-                ip_filename = f"img_{visual_counter:03d}.xhtml"
-                ip_id = f"imgpage{visual_counter:03d}"
-                title = f"Ilustraciones {visual_counter}"
-                zf.writestr(
-                    f"OEBPS/Text/{ip_filename}",
-                    build_image_sequence_xhtml(item["images"], lang=lang, title=escape_xml(title)),
-                )
-                manifest_items.append({"id": ip_id, "href": f"Text/{ip_filename}",
-                                       "media_type": "application/xhtml+xml"})
-                spine_idrefs.append(ip_id)
-            else:
-                text_counter += 1
-                ch_idx = item["ch_idx"]
-                chapter = chapters[ch_idx]
-                filename = f"{text_counter:03d}.xhtml"
-                item_id = f"cap{text_counter:03d}"
-                first_global = item["start_idx"] == 0
-                xhtml = chapter_fragment_to_xhtml(
-                    chapter,
-                    start_idx=item["start_idx"],
-                    end_idx=item["end_idx"],
-                    lang=lang,
-                    include_header=item.get("include_header", False),
-                    first_text_para_global=first_global,
-                )
-                zf.writestr(f"OEBPS/Text/{filename}", xhtml)
-                manifest_items.append({"id": item_id, "href": f"Text/{filename}",
-                                       "media_type": "application/xhtml+xml"})
-                spine_idrefs.append(item_id)
-
-                if ch_idx not in chapter_nav_written:
-                    title = chapter["title"]
-                    subtitle = chapter.get("subtitle", "")
-                    nav_points.append({
-                        "label": f"{title}: {subtitle}" if subtitle else title,
-                        "src": f"Text/{filename}",
-                    })
-                    chapter_nav_written.add(ch_idx)
-
-        zf.writestr("OEBPS/content.opf",
-                    build_opf(meta, manifest_items, spine_idrefs, book_uuid))
-        zf.writestr("OEBPS/toc.ncx",
-                    build_ncx(meta, nav_points, book_uuid))
-
-    print(f"\n  ✅ EPUB generado: {output_path}")
-    size_kb = os.path.getsize(output_path) / 1024
-    print(f"     Tamaño: {size_kb:.1f} KB | "
-          f"Capítulos: {len(chapters)} | Imágenes: {len(images)}")
 
 
 # ─────────────────────────────────────────────
