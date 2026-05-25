@@ -559,7 +559,7 @@ HTML = r"""<!DOCTYPE html>
 </main>
 
 <footer>
-  <span>pdf2epub · Perfil Apotecaria</span>
+  <span>pdf2epub · Perfil CoTE</span>
   <span id="ft-server">localhost:7474</span>
 </footer>
 
@@ -878,7 +878,7 @@ def _run_conversion(job_id, pdf_path, cover_path, config, job_dir):
         p2e = importlib.reload(p2e)
 
         print(f"\n{'='*55}")
-        print(f"  PDF → EPUB Converter  |  Perfil: Apotecaria")
+        print(f"  PDF → EPUB Converter  |  Perfil: CoTE")
         print(f"{'='*55}")
 
         # Metadatos — resolver título antes de definir output_path

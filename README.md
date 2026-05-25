@@ -1,114 +1,121 @@
-# PDF → EPUB Converter v2 con OCR
+# PDF → EPUB Converter (Local Web Tool)
 
-Proyecto local para convertir PDF a EPUB con dos rutas de extracción:
+Herramienta local para convertir PDF a EPUB con interfaz web, enfocada
+en libros narrativos (especialmente novelas ligeras e ilustradas).
 
-- extracción normal para PDFs con texto real
-- OCR opcional para páginas escaneadas o con texto corrupto
+------------------------------------------------------------------------
 
-## Contenido
+## ✨ Características
 
-- `pdf2epub.py`: motor principal PDF → EPUB.
-- `gui.py`: interfaz web local.
-- `requirements.txt`: dependencias Python.
-- `run_gui.bat`: arranca la GUI.
-- `run_cli_example.bat`: ejemplo CLI.
+-   Interfaz web local (no depende de servicios externos)
+-   Conversión PDF → EPUB optimizada para lectura
+-   Detección automática de:
+    -   Prólogo
+    -   Capítulos
+    -   Epílogo
+    -   Afterword
+    -   Historias extra
+-   Preserva:
+    -   estructura narrativa
+    -   títulos y subtítulos de capítulos
+    -   flujo del contenido
+-   Manejo de imágenes:
+    -   conserva ilustraciones relevantes
+    -   elimina imágenes decorativas repetidas
+-   OCR opcional para PDFs escaneados o con texto corrupto
 
-## Requisitos
+------------------------------------------------------------------------
 
-- Python 3.11 o superior recomendado.
-- Windows, Linux o macOS.
-- **Tesseract OCR** instalado si quieres usar OCR.
+## 🧠 Enfoque del proyecto
 
-## Instalar dependencias Python
+Este convertidor no busca solo "sacar texto del PDF", sino:
 
-```bash
-python -m venv .venv
-```
+-   evitar que la tabla de contenido se trate como texto real
+-   separar correctamente capítulos
+-   conservar títulos en lugar de convertirlos en párrafos normales
+-   mantener una experiencia de lectura coherente en EPUB
 
-### Windows
+------------------------------------------------------------------------
 
-```bash
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
+## 📁 Contenido del proyecto
 
-### Linux / macOS
+-   `pdf2epub.py`: motor principal PDF → EPUB
+-   `gui.py`: interfaz web local
+-   `requirements.txt`: dependencias Python
+-   `run_gui.bat`: lanzador automático
 
-```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+------------------------------------------------------------------------
 
-## Instalar Tesseract OCR
+## 🚀 Uso rápido (recomendado)
 
-### Windows
+1.  Ejecuta:
 
-Instala Tesseract y asegúrate de que `tesseract.exe` quede en el `PATH` del sistema.
-Si no queda en `PATH`, puedes pasar su ruta con `--tesseract-cmd`.
+run_gui.bat
 
-### Linux
+2.  El script:
+    -   detecta Python
+    -   crea entorno virtual (si no existe)
+    -   instala dependencias automáticamente
+    -   abre la interfaz web
+3.  Usa el navegador para convertir tu PDF
 
-```bash
-sudo apt install tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng
-```
+------------------------------------------------------------------------
 
-### macOS
+## 🔧 Mejoras recientes
 
-```bash
-brew install tesseract
-brew install tesseract-lang
-```
+### 🖼️ Manejo de imágenes mejorado
 
-## Uso por línea de comandos
+Antes: - EPUB se veía bien en PC - En móvil podían aparecer: - imágenes
+negras - imágenes cortadas - bloques grises/negros
 
-### Sin OCR
+Ahora: - Imágenes funcionan correctamente en: - móvil - escritorio -
+Eliminación de imágenes basura del PDF - Mejor compatibilidad entre
+lectores EPUB
 
-```bash
-python pdf2epub.py "Volumen 15.pdf" -o "Volumen 15.epub"
-```
+Tradeoff: - layout inicial de imágenes más controlado - menos
+"compacto", pero mucho más estable
 
-### OCR automático
+------------------------------------------------------------------------
 
-```bash
-python pdf2epub.py "u2.1 (1).pdf" -o "u2.1.epub" --ocr auto --ocr-lang spa+eng
-```
+### 🧹 Limpieza de headers/footers
 
-### OCR forzado en todas las páginas
+-   Eliminación mejorada de líneas repetidas
+-   Detección por patrón (no solo coincidencia exacta)
 
-```bash
-python pdf2epub.py "u2.1 (1).pdf" -o "u2.1_ocr.epub" --ocr force --ocr-lang spa+eng
-```
+------------------------------------------------------------------------
 
-### Si `tesseract.exe` no está en PATH
+### 📖 Mejora en títulos de capítulos
 
-```bash
-python pdf2epub.py "u2.1 (1).pdf" -o "u2.1_ocr.epub" --ocr auto --ocr-lang spa+eng --tesseract-cmd "C:\Program Files\Tesseract-OCR\tesseract.exe"
-```
+-   Detecta correctamente capítulos y secciones
+-   Conserva subtítulos
+-   Evita convertirlos en texto plano
 
-## Uso con interfaz web
+------------------------------------------------------------------------
 
-```bash
-python gui.py
-```
+## ⚠️ Limitaciones
 
-Luego abre en tu navegador:
+-   tablas complejas
+-   fórmulas
+-   PDFs tipo revista
+-   maquetación en columnas
 
-- `http://localhost:7474`
+------------------------------------------------------------------------
 
-La GUI incluye:
+## ⚙️ Tecnologías
 
-- selector de modo OCR: desactivado, auto o forzado
-- idiomas OCR
-- recarga de `pdf2epub.py` desde disco al convertir
+-   Python
+-   Flask
+-   PyMuPDF / pdfminer / pypdf
+-   Pillow
+-   Tesseract OCR
 
-## Qué mejora esta v2
+------------------------------------------------------------------------
 
-- mantiene el arreglo del orden de imágenes internas
-- puede relanzar OCR solo en páginas problemáticas
-- sirve mejor para PDFs escaneados o con capa de texto muy dañada
+## 📌 Resumen
 
-## Limitaciones
+Una herramienta local PDF → EPUB pensada para libros narrativos, que:
 
-- tablas, fórmulas y diagramas pueden seguir quedando imperfectos
-- el OCR mejora mucho texto corrido, pero no “entiende” la maquetación compleja como un humano
-- para novelas y textos lineales suele dar mejores resultados que para libros técnicos
+-   reconstruye la estructura del libro
+-   limpia artefactos del PDF
+-   conserva capítulos y títulos
+-   y ahora ofrece mejor compatibilidad entre dispositivos
