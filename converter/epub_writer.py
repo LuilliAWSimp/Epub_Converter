@@ -16,6 +16,7 @@ from converter.chapters import (
     _normalize_spine_fragments,
     _validate_spine_fragments,
 )
+from converter.image_filters import _flatten_image_for_mobile_compat
 
 
 CSS_PROFILE = """\
