@@ -6,7 +6,11 @@ editoriales y el OCR opcional mediante Tesseract. Se usa desde CLI y GUI.
 """
 
 import io
+import math
 import os
+import pickle
+import tempfile
+from collections import OrderedDict
 import re
 import shutil
 import subprocess
@@ -143,17 +147,44 @@ def _should_ocr_page(text: str, config: dict) -> tuple[bool, str, float]:
 
     return False, f'texto aceptable (score={garbage_score:.2f})', garbage_score
 
-def _render_page_to_png_bytes(pdf_path: str, page_index: int, dpi: int = DEFAULT_OCR_DPI) -> bytes:
+# E05: límite conservador para evitar que un solo pliego escaneado agote la RAM.
+MAX_OCR_RENDER_PIXELS = 20_000_000
+
+
+def _render_page_to_png_bytes(pdf_path: str, page_index: int,
+                              dpi: int = DEFAULT_OCR_DPI, *, doc=None) -> bytes:
+    """Rasteriza una página. Si se pasa `doc`, no reabre el PDF por página.
+
+    Reduce proporcionalmente el DPI para pliegos excepcionalmente grandes y
+    rechaza páginas que ni siquiera caben en el límite a 72 DPI.
+    """
     import fitz  # PyMuPDF
 
-    zoom = max(72, int(dpi)) / 72.0
-    doc = fitz.open(pdf_path)
+    own_doc = doc is None
+    if own_doc:
+        doc = fitz.open(pdf_path)
     try:
         page = doc.load_page(page_index)
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        return pix.tobytes('png')
+        dpi = max(72, int(dpi))
+        w, h = float(page.rect.width), float(page.rect.height)
+        if w <= 0 or h <= 0:
+            raise ValueError(f'Página {page_index + 1}: dimensiones inválidas para OCR')
+        pixels = w * h * (dpi / 72.0) ** 2
+        if pixels > MAX_OCR_RENDER_PIXELS:
+            dpi = int(dpi * math.sqrt(MAX_OCR_RENDER_PIXELS / pixels))
+            if dpi < 72:
+                raise ValueError(
+                    f'Página {page_index + 1}: imagen demasiado grande para OCR seguro'
+                )
+            print(f'    [OCR E05] Página {page_index + 1}: DPI ajustado a {dpi} por memoria')
+        pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0), alpha=False)
+        try:
+            return pix.tobytes('png')
+        finally:
+            del pix
     finally:
-        doc.close()
+        if own_doc:
+            doc.close()
 
 def _ocr_png_bytes(png_bytes: bytes, config: dict) -> str:
     from PIL import Image
@@ -225,28 +256,43 @@ def apply_ocr_to_pages(pdf_path: str, raw_pages: list[str], config: dict) -> tup
     print(f'  OCR: tesseract={resolved_cmd}')
     ocr_config = dict(config, _ocr_engine_ready=True)
 
-    for idx, reason in pending:
-        stats['pages_attempted'] += 1
-        try:
-            png_bytes = _render_page_to_png_bytes(pdf_path, idx, dpi=dpi)
-            ocr_text = _ocr_png_bytes(png_bytes, ocr_config).strip()
-            if ocr_text:
-                replaced[idx] = ocr_text
-                stats['pages_replaced'] += 1
-                stats['page_indexes'].append(idx)
-                stats['reasons'][idx] = reason
-                stats['applied'] = True
-                print(f'    OCR página {idx+1}: {reason}')
-            else:
-                print(f'    ⚠️  OCR página {idx+1}: sin texto reconocible; se conserva extracción normal')
-                stats['warnings'].append(f'Página {idx+1}: OCR no encontró texto')
-        except Exception as exc:
-            stats['pages_failed'] += 1
-            message = f'OCR página {idx+1}: fallo ({exc})'
-            if mode == 'force':
-                raise RuntimeError(message) from exc
-            stats['warnings'].append(message)
-            print(f'    ⚠️  {message}; se conserva extracción normal')
+    # E05: un solo descriptor PyMuPDF para todas las páginas con OCR.
+    import fitz
+    try:
+        ocr_doc = fitz.open(pdf_path)
+    except Exception as exc:
+        message = f'OCR no pudo abrir el PDF: {exc}'
+        if mode == 'force':
+            raise RuntimeError(message) from exc
+        stats['pages_failed'] += len(pending)
+        stats['warnings'].append(message)
+        print(f'  ⚠️  {message}; se conserva la extracción normal')
+        return raw_pages, stats
+    try:
+        for idx, reason in pending:
+            stats['pages_attempted'] += 1
+            try:
+                png_bytes = _render_page_to_png_bytes(pdf_path, idx, dpi=dpi, doc=ocr_doc)
+                ocr_text = _ocr_png_bytes(png_bytes, ocr_config).strip()
+                if ocr_text:
+                    replaced[idx] = ocr_text
+                    stats['pages_replaced'] += 1
+                    stats['page_indexes'].append(idx)
+                    stats['reasons'][idx] = reason
+                    stats['applied'] = True
+                    print(f'    OCR página {idx+1}: {reason}')
+                else:
+                    print(f'    ⚠️  OCR página {idx+1}: sin texto reconocible; se conserva extracción normal')
+                    stats['warnings'].append(f'Página {idx+1}: OCR no encontró texto')
+            except Exception as exc:
+                stats['pages_failed'] += 1
+                message = f'OCR página {idx+1}: fallo ({exc})'
+                if mode == 'force':
+                    raise RuntimeError(message) from exc
+                stats['warnings'].append(message)
+                print(f'    ⚠️  {message}; se conserva extracción normal')
+    finally:
+        ocr_doc.close()
 
     if mode == 'force' and stats['pages_replaced'] == 0:
         raise RuntimeError('OCR forzado no reconoció texto en ninguna página. Verifica el PDF y los idiomas.')
@@ -269,45 +315,68 @@ def _build_image_record(page_idx: int,
                         caption: str,
                         bbox=None,
                         page_width: float | None = None,
-                        page_height: float | None = None) -> tuple[dict | None, dict | None]:
-    """Normaliza una imagen extraída y devuelve (imagen_valida, descarte)."""
-    safe_img, img_data, ext, media_type = _encode_image_for_epub(pil_img)
-    visual_hash = _image_visual_hash_from_pil(safe_img)
-    name = f"img{img_counter:03d}.{ext}"
+                        page_height: float | None = None,
+                        prepared: dict | None = None) -> tuple[dict | None, dict | None]:
+    """Crea una ocurrencia visual con metadatos de su página concreta.
+
+    `prepared` permite reutilizar JPEG, análisis visual y hash de un mismo
+    xref entre páginas. El bbox, la leyenda y el filtro contextual NO se cachean.
+    """
+    if prepared is None:
+        prepared = {}
+    if 'data' not in prepared:
+        if pil_img is None:
+            raise ValueError('La imagen no está disponible para preparar el recurso')
+        safe_img, img_data, ext, media_type = _encode_image_for_epub(pil_img)
+        prepared.update({
+            'data': img_data, 'ext': ext, 'media_type': media_type,
+            'width': safe_img.width, 'height': safe_img.height,
+            '_visual_hash': _image_visual_hash_from_pil(safe_img),
+            '_artifact': _looks_like_image_artifact(safe_img),
+        })
+    else:
+        safe_img = None
+
+    name = f"img{img_counter:03d}.{prepared['ext']}"
     base = {
         "page_idx": page_idx,
         "name": name,
-        "data": img_data,
-        "ext": ext,
-        "media_type": media_type,
+        "data": prepared['data'],
+        "ext": prepared['ext'],
+        "media_type": prepared['media_type'],
         "is_full_page": is_full_page,
         "caption": caption,
-        "width": safe_img.width,
-        "height": safe_img.height,
+        "width": prepared['width'],
+        "height": prepared['height'],
         "bbox": tuple(float(v) for v in bbox) if bbox else None,
         "page_width": float(page_width or 0),
         "page_height": float(page_height or 0),
-        "_visual_hash": visual_hash,
+        "_visual_hash": prepared['_visual_hash'],
     }
 
-    if _looks_like_image_artifact(safe_img):
+    if prepared['_artifact']:
         discard = dict(base)
-        discard["discard_reason"] = "artefacto_visual_pdf"
-        discard["_position_bucket"] = _image_position_bucket(discard)
+        discard['discard_reason'] = 'artefacto_visual_pdf'
+        discard['_position_bucket'] = _image_position_bucket(discard)
         return None, discard
 
-    # Filtro específico para el caso de flores/marcos editoriales extraídos
-    # como un rectángulo grande con fondo uniforme. No se aplica a páginas
-    # completas ni a páginas casi sin texto para proteger ilustraciones reales.
-    page_has_text = len((page_text or "").strip()) >= 80
+    # Motivos sólo en páginas con prosa. El resultado visual se calcula una vez
+    # por xref, pero la decisión de descartarlo depende siempre de esta página.
+    page_has_text = len((page_text or '').strip()) >= 80
     if page_has_text and not is_full_page:
-        is_motif, motif_reason = _looks_like_decorative_motif_image(safe_img)
+        if '_motif' not in prepared:
+            if safe_img is not None:
+                prepared['_motif'] = _looks_like_decorative_motif_image(safe_img)
+            else:
+                from PIL import Image
+                with Image.open(io.BytesIO(prepared['data'])) as reopened:
+                    prepared['_motif'] = _looks_like_decorative_motif_image(reopened)
+        is_motif, motif_reason = prepared['_motif']
         if is_motif:
             discard = dict(base)
-            discard["discard_reason"] = motif_reason or "motivo_decorativo"
-            discard["_position_bucket"] = _image_position_bucket(discard)
+            discard['discard_reason'] = motif_reason or 'motivo_decorativo'
+            discard['_position_bucket'] = _image_position_bucket(discard)
             return None, discard
-
     return base, None
 
 def _extract_images_with_pymupdf(pdf_path: str, pages_text: list[str], total: int) -> tuple[list[dict], list[dict]]:
@@ -318,6 +387,13 @@ def _extract_images_with_pymupdf(pdf_path: str, pages_text: list[str], total: in
     images: list[dict] = []
     discarded: list[dict] = []
     img_counter = 0
+    # Cache acotada por xref: las páginas suelen repetir sellos e ilustraciones.
+    # Guardamos sólo JPEG compactado y análisis, no bitmaps PIL decodificados.
+    cache: OrderedDict[int, dict] = OrderedDict()
+    cache_bytes = 0
+    cache_hits = 0
+    cache_limit = 24 * 1024 * 1024
+    cache_entries_limit = 128
 
     doc = fitz.open(pdf_path)
     try:
@@ -350,27 +426,47 @@ def _extract_images_with_pymupdf(pdf_path: str, pages_text: list[str], total: in
 
                 img_counter += 1
                 try:
-                    if xref > 0:
-                        extracted = doc.extract_image(xref)
-                        img_bytes = extracted.get("image")
-                        if not img_bytes:
-                            continue
-                        pil_img = Image.open(io.BytesIO(img_bytes))
+                    prepared = None
+                    pil_img = None
+                    if xref > 0 and xref in cache:
+                        prepared = cache[xref]
+                        cache.move_to_end(xref)
+                        cache_hits += 1
                     else:
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect, alpha=True)
-                        pil_img = Image.open(io.BytesIO(pix.tobytes("png")))
-
-                    record, discard = _build_image_record(
-                        page_idx=page_idx,
-                        img_counter=img_counter,
-                        pil_img=pil_img,
-                        page_text=page_text,
-                        is_full_page=is_full_page,
-                        caption=caption,
-                        bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
-                        page_width=page.rect.width,
-                        page_height=page.rect.height,
-                    )
+                        if xref > 0:
+                            extracted = doc.extract_image(xref)
+                            img_bytes = extracted.get('image')
+                            if not img_bytes:
+                                continue
+                            pil_img = Image.open(io.BytesIO(img_bytes))
+                        else:
+                            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect, alpha=True)
+                            pil_img = Image.open(io.BytesIO(pix.tobytes('png')))
+                        prepared = {}
+                    try:
+                        record, discard = _build_image_record(
+                            page_idx=page_idx,
+                            img_counter=img_counter,
+                            pil_img=pil_img,
+                            page_text=page_text,
+                            is_full_page=is_full_page,
+                            caption=caption,
+                            bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
+                            page_width=page.rect.width,
+                            page_height=page.rect.height,
+                            prepared=prepared,
+                        )
+                    finally:
+                        if pil_img is not None:
+                            pil_img.close()
+                    if xref > 0 and xref not in cache:
+                        size = len(prepared.get('data', b''))
+                        if 0 < size <= cache_limit:
+                            while cache and (len(cache) >= cache_entries_limit or cache_bytes + size > cache_limit):
+                                _, old = cache.popitem(last=False)
+                                cache_bytes -= len(old['data'])
+                            cache[xref] = prepared
+                            cache_bytes += size
                     if discard:
                         discarded.append(discard)
                     elif record:
@@ -379,7 +475,8 @@ def _extract_images_with_pymupdf(pdf_path: str, pages_text: list[str], total: in
                     print(f"  [Imágenes] ⚠️  No se pudo extraer imagen en pág {page_idx+1}: {ex}")
     finally:
         doc.close()
-
+    if cache_hits:
+        print(f'  [Imágenes E05] {cache_hits} reutilización(es) de recursos PDF sin recodificar')
     return images, discarded
 
 def _extract_images_with_pypdf(reader, pages_text: list[str], total: int) -> tuple[list[dict], list[dict]]:
@@ -449,59 +546,54 @@ def extract_pdf_content(pdf_path: str) -> tuple[list[str], list[dict]]:
         from pdfminer.layout import LAParams, LTTextContainer
         laparams = LAParams(line_margin=0.5, word_margin=0.1)
 
-        # Primera pasada: recopilar alturas de página y bloques con posición
-        page_layouts = list(extract_pages(pdf_path, laparams=laparams))
-
-        # Detectar zona de header/footer por posición Y relativa
-        # Un bloque está en la zona de header si está en el 10% superior,
-        # o en la zona de footer si está en el 10% inferior.
-        HEADER_ZONE = 0.90  # y/altura > 0.90 → header
-        FOOTER_ZONE = 0.10  # y/altura < 0.10 → footer
-
-        # Recopilar textos de header/footer candidates para detección por repetición
+        # E05: un único recorrido de pdfminer y bloques serializados a un
+        # temporal con volcado a disco. No acumular LTPage ni todos los bloques
+        # de cientos/miles de páginas simultáneamente en memoria.
+        HEADER_ZONE = 0.90
+        FOOTER_ZONE = 0.10
         from collections import Counter
         header_footer_counter: Counter = Counter()
 
-        raw_blocks: list[list[tuple]] = []  # por página: [(y_rel, text), ...]
-        for page_layout in page_layouts:
-            h = page_layout.height or 842
-            blocks = []
-            for elem in page_layout:
-                if isinstance(elem, LTTextContainer):
-                    txt = elem.get_text().strip()
-                    if not txt:
-                        continue
-                    y_rel = elem.bbox[1] / h  # posición relativa desde abajo
-                    is_border = y_rel > HEADER_ZONE or y_rel < FOOTER_ZONE
-                    blocks.append((y_rel, txt, is_border))
-                    if is_border:
-                        header_footer_counter[txt] += 1
-            raw_blocks.append(blocks)
-
-        # Líneas que aparecen ≥4 veces en zona de borde = header/footer confirmado
-        confirmed_hf = {txt for txt, cnt in header_footer_counter.items() if cnt >= 4}
-
-        # Patrones de header/footer variables (número de página, nombre del libro…)
-        # Detectamos la parte fija: si la línea sin número coincide ≥4 veces
         HF_VARIABLE_PATTERNS = [
-            re.compile(r'P[áa]gina\s+N[°º]?\s*\d+', re.IGNORECASE),  # Página N° 12
-            re.compile(r'\bpág(?:ina)?\s*\.?\s*\d+', re.IGNORECASE),  # Pág. 12
-            re.compile(r'^\d{1,4}$'),                                   # solo número
-            re.compile(r'^[\-–—]\s*\d+\s*[\-–—]$'),                    # — 12 —
+            re.compile(r'P[áa]gina\s+N[°º]?\s*\d+', re.IGNORECASE),
+            re.compile(r'\bpág(?:ina)?\s*\.?\s*\d+', re.IGNORECASE),
+            re.compile(r'^\d{1,4}$'),
+            re.compile(r'^[\-–—]\s*\d+\s*[\-–—]$'),
         ]
 
-        # Segunda pasada: construir texto limpio por página
-        for blocks in raw_blocks:
-            page_lines = []
-            for y_rel, txt, is_border in blocks:
-                # Saltar si es header/footer confirmado por repetición
-                if txt in confirmed_hf:
-                    continue
-                # Saltar si está en zona de borde y coincide con patrón variable
-                if is_border and any(p.search(txt) for p in HF_VARIABLE_PATTERNS):
-                    continue
-                page_lines.append(txt)
-            pages_text.append("\n".join(page_lines))
+        # El temporal se cierra/elimina incluso si pdfminer genera una excepción.
+        with tempfile.SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode='w+b') as spool:
+            layout_count = 0
+            for page_layout in extract_pages(pdf_path, laparams=laparams):
+                h = page_layout.height or 842
+                blocks = []
+                for elem in page_layout:
+                    if isinstance(elem, LTTextContainer):
+                        txt = elem.get_text().strip()
+                        if not txt:
+                            continue
+                        y_rel = elem.bbox[1] / h
+                        is_border = y_rel > HEADER_ZONE or y_rel < FOOTER_ZONE
+                        blocks.append((is_border, txt))
+                        if is_border:
+                            header_footer_counter[txt] += 1
+                pickle.dump(blocks, spool, protocol=pickle.HIGHEST_PROTOCOL)
+                layout_count += 1
+                if layout_count % 100 == 0:
+                    print(f'  [PDF E05] Páginas analizadas: {layout_count}/{total}', flush=True)
+
+            confirmed_hf = {txt for txt, cnt in header_footer_counter.items() if cnt >= 4}
+            spool.seek(0)
+            for _ in range(layout_count):
+                blocks = pickle.load(spool)
+                page_lines = []
+                for is_border, txt in blocks:
+                    if txt in confirmed_hf:
+                        continue
+                    if is_border and any(p.search(txt) for p in HF_VARIABLE_PATTERNS):
+                        continue
+                    page_lines.append(txt)
+                pages_text.append('\n'.join(page_lines))
 
         print(f"  [PDF] Extraídas {total} páginas con pdfminer.")
         if confirmed_hf:
@@ -511,6 +603,7 @@ def extract_pdf_content(pdf_path: str) -> tuple[list[str], list[dict]]:
 
     except Exception as e:
         print(f"  [PDF] pdfminer falló ({e}), usando pypdf para texto...")
+        pages_text = []  # descartar extracción incompleta antes del fallback
         for page in reader.pages:
             pages_text.append(page.extract_text() or "")
         print(f"  [PDF] Extraídas {total} páginas con pypdf.")

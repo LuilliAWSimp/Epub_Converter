@@ -347,10 +347,13 @@ def chapter_fragment_to_xhtml(chapter: dict, start_idx: int, end_idx: int,
 
     suppress_images = suppress_images or set()
     img_by_pos: dict[int, list] = {}
-    seen_img_names: set[str] = set()
+    seen_occurrences: set[str] = set()
     for img in inline_images:
         imgname = img.get("imgname", "")
-        if not imgname or imgname in seen_img_names or imgname in suppress_images:
+        # E05: el mismo JPEG puede representarse en páginas diferentes;
+        # evitar sólo la inserción repetida de la MISMA ocurrencia.
+        occurrence = img.get('occurrence_id', imgname)
+        if not imgname or occurrence in seen_occurrences or imgname in suppress_images:
             continue
         pos = img.get("after_para_idx", -1)
         if pos < start_idx - 1 or pos >= end_idx:
@@ -359,7 +362,7 @@ def chapter_fragment_to_xhtml(chapter: dict, start_idx: int, end_idx: int,
         img_copy = dict(img)
         img_copy["after_para_idx"] = rebased
         img_by_pos.setdefault(rebased, []).append(img_copy)
-        seen_img_names.add(imgname)
+        seen_occurrences.add(occurrence)
 
     for img in img_by_pos.get(-1, []):
         body_parts.append(inline_image_html(img["imgname"], img.get("caption", ""), img.get("layout", "inline")))
@@ -556,7 +559,26 @@ def _create_epub_unchecked(chapters: list[dict], meta: dict, output_path: str,
       - la portada automática no se duplica como página normal
     """
     lang = meta.get("lang", "es")
-    images = images or []
+    # E05: una misma ilustración puede aparecer en varias páginas. Conservar
+    # todas las ocurrencias y leyendas, pero apuntar al mismo JPEG del EPUB.
+    # Hacer copia superficial de los registros para no mutar el lote de entrada.
+    images = [dict(img) for img in (images or [])]
+    from hashlib import sha256
+    seen_bitmap: dict[tuple[str, str], list[dict]] = {}
+    repeated_assets = 0
+    for img in images:
+        img['_occurrence_name'] = img['name']
+        signature = (img['media_type'], sha256(img['data']).hexdigest())
+        candidates = seen_bitmap.setdefault(signature, [])
+        original = next((candidate for candidate in candidates
+                         if candidate['data'] == img['data']), None)
+        if original is not None:
+            img['name'] = original['name']
+            repeated_assets += 1
+        else:
+            candidates.append(img)
+    if repeated_assets:
+        print(f'  [Imágenes E05] Recursos EPUB repetidos evitados: {repeated_assets}')
     raw_pages = raw_pages or []
     pages_paragraphs = pages_paragraphs or []
     n_pages = len(raw_pages)
@@ -599,6 +621,7 @@ def _create_epub_unchecked(chapters: list[dict], meta: dict, output_path: str,
             chapters[ch_idx]["inline_images"].append({
                 "after_para_idx": after_idx,
                 "imgname": iimg["name"],
+                "occurrence_id": iimg['_occurrence_name'],
                 "caption": iimg.get("caption", ""),
                 "layout": "inline",
             })
@@ -631,6 +654,7 @@ def _create_epub_unchecked(chapters: list[dict], meta: dict, output_path: str,
             chapters[ch_idx]["inline_images"].append({
                 "after_para_idx": after_idx,
                 "imgname": fimg["name"],
+                "occurrence_id": fimg['_occurrence_name'],
                 "caption": fimg.get("caption", ""),
                 "layout": "fullblock",
             })
@@ -864,8 +888,11 @@ def _create_epub_unchecked(chapters: list[dict], meta: dict, output_path: str,
                       f'<h2 class="subtitulo">{escape_xml(meta.get("author",""))}</h2>'),
             ))
 
+        written_images: set[str] = set()
         for img in images:
-            zf.writestr(f"OEBPS/Images/{img['name']}", img["data"])
+            if img['name'] not in written_images:
+                zf.writestr(f"OEBPS/Images/{img['name']}", img['data'])
+                written_images.add(img['name'])
 
         manifest_items: list[dict] = []
         spine_idrefs: list[str] = []
@@ -878,7 +905,11 @@ def _create_epub_unchecked(chapters: list[dict], meta: dict, output_path: str,
             manifest_items.append({"id": "cover-image", "href": "Images/cover.jpg",
                                    "media_type": "image/jpeg"})
 
+        manifest_images: set[str] = set()
         for img in images:
+            if img['name'] in manifest_images:
+                continue
+            manifest_images.add(img['name'])
             manifest_items.append({
                 "id": f"img-{img['name'].replace('.', '-')}",
                 "href": f"Images/{img['name']}",
