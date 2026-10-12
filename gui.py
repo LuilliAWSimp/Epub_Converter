@@ -9,16 +9,19 @@ Luego abrir: http://localhost:7474
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
-import traceback
 import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request, send_file
+
+from converter.local_security import is_allowed_request
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024  # 300 MB
@@ -32,6 +35,18 @@ for _dir in (APP_DATA_DIR, JOBS_DIR, EXPORTS_DIR, TEMP_DIR):
 
 # Estado de trabajos activos {job_id: {status, log, output_path, ...}}
 JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.RLock()
+EXPORT_LOCK = threading.Lock()
+CLEANUP_LOCK = threading.Lock()
+MAX_ACTIVE_JOBS = 2
+MAX_LOG_CHARS = 50000
+JOB_TIMEOUT_SECONDS = 2 * 60 * 60
+JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60
+ORPHAN_RETENTION_SECONDS = 24 * 60 * 60
+EXPORT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+MAX_EXPORT_BYTES = 2 * 1024 * 1024 * 1024
+CLEANUP_INTERVAL_SECONDS = 15 * 60
+_last_cleanup = 0.0
 
 
 def _sanitize_stem(value: str, default: str = "archivo") -> str:
@@ -45,7 +60,7 @@ def _make_job_dir_name(filename: str | None) -> str:
     stem = _sanitize_stem(Path(filename or "libro.pdf").stem, default="libro")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     short_id = uuid.uuid4().hex[:6]
-    return f"{timestamp}_{stem}_{short_id}"
+    return f"{timestamp}_{stem[:60]}_{short_id}"
 
 
 def _unique_export_path(stem: str, suffix: str = ".epub") -> Path:
@@ -595,18 +610,18 @@ dropPdf.addEventListener('drop', e => setPdf(e.dataTransfer.files[0]));
 inputPdf.addEventListener('change', () => setPdf(inputPdf.files[0]));
 
 function setPdf(file) {
-  if (!file || !file.name.endsWith('.pdf')) return;
+  if (!file || !file.name.toLowerCase().endsWith('.pdf')) return;
   pdfFile = file;
   dropPdf.classList.add('has-file');
 
   // Mostrar nombre + tamaño
   const mb = (file.size / 1024 / 1024).toFixed(1);
-  pdfInfo.innerHTML = `📖 <strong>${file.name}</strong> — ${mb} MB<span class="pages-badge" id="pages-count">leyendo…</span>`;
+  pdfInfo.innerHTML = `📖 <strong>${escHtml(file.name)}</strong> — ${mb} MB<span class="pages-badge" id="pages-count">leyendo…</span>`;
 
   // Contar páginas y leer metadatos en el servidor
   const fd = new FormData();
   fd.append('pdf', file);
-  fetch('/api/pagecount', { method: 'POST', body: fd })
+  fetch('/api/pagecount', { method: 'POST', headers: { 'X-Requested-With': 'XMLHttpRequest' }, body: fd })
     .then(r => r.json())
     .then(d => {
       const badge = document.getElementById('pages-count');
@@ -682,13 +697,15 @@ async function startConversion() {
   fd.append('verbose', document.getElementById('f-verbose').checked ? '1' : '0');
 
   try {
-    const resp = await fetch('/api/convert', { method: 'POST', body: fd });
+    const resp = await fetch('/api/convert', { method: 'POST', headers: { 'X-Requested-With': 'XMLHttpRequest' }, body: fd });
     const data = await resp.json();
     if (!data.job_id) throw new Error(data.error || 'Error al iniciar conversión');
     currentJobId = data.job_id;
     pollInterval = setInterval(pollStatus, 800);
   } catch (err) {
     showError(err.message);
+    btnConvert.disabled = false;
+    btnConvert.textContent = 'Convertir a EPUB';
   }
 }
 
@@ -765,244 +782,302 @@ function escHtml(s) {
 """
 
 # ─────────────────────────────────────────────
+#  SEGURIDAD LOCAL / RETENCIÓN
+# ─────────────────────────────────────────────
+
+
+def prune_storage(force=False, now=None):
+    """Elimina sólo trabajos terminados y ficheros antiguos; jamás uno activo."""
+    global _last_cleanup
+    now = time.time() if now is None else now
+    with CLEANUP_LOCK:
+        if not force and now - _last_cleanup < CLEANUP_INTERVAL_SECONDS:
+            return
+        _last_cleanup = now
+        with JOBS_LOCK:
+            active_dirs = {job.get('job_dir') for job in JOBS.values()
+                           if job.get('status') == 'running'}
+            for key, job in list(JOBS.items()):
+                if job.get('status') != 'running' and now - job.get('created_at', now) >= JOB_RETENTION_SECONDS:
+                    del JOBS[key]
+        for folder in (JOBS_DIR, TEMP_DIR):
+            for path in folder.iterdir():
+                if str(path) in active_dirs:
+                    continue
+                try:
+                    if now - path.stat().st_mtime > ORPHAN_RETENTION_SECONDS:
+                        if path.is_dir() and not path.is_symlink():
+                            shutil.rmtree(path)
+                        elif path.is_file() or path.is_symlink():
+                            path.unlink()
+                except OSError:
+                    pass  # Windows puede mantener archivos temporalmente bloqueados
+
+        exports = []
+        for path in EXPORTS_DIR.glob('*.epub'):
+            try:
+                stat = path.stat()
+                if now - stat.st_mtime > EXPORT_RETENTION_SECONDS:
+                    path.unlink()
+                else:
+                    exports.append((stat.st_mtime, stat.st_size, path))
+            except OSError:
+                continue
+        total = sum(size for _, size, _ in exports)
+        for _, size, path in sorted(exports):
+            if total <= MAX_EXPORT_BYTES:
+                break
+            try:
+                path.unlink()
+                total -= size
+            except OSError:
+                continue
+
+
+def _protect_local_access():
+    """Los endpoints locales no admiten clientes remotos ni solicitudes CSRF."""
+    if not is_allowed_request(
+        request.host, request.remote_addr,
+        origin=request.headers.get('Origin'),
+        referer=request.headers.get('Referer'),
+        method=request.method,
+        fetch_site=request.headers.get('Sec-Fetch-Site'),
+        requested_with=request.headers.get('X-Requested-With'),
+    ):
+        return jsonify({'error': 'Acceso permitido sólo desde la interfaz local.'}), 403
+    prune_storage()
+    return None
+
+
+# ``before_request`` se registra cuando Flask está disponible. Los stubs de
+# pruebas E03 sólo implementan ``route``; su prueba unitaria sigue siendo válida.
+if hasattr(app, 'before_request'):
+    app.before_request(_protect_local_access)
+
+if hasattr(app, 'after_request'):
+    @app.after_request
+    def _security_headers(response):
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['Referrer-Policy'] = 'same-origin'
+        if request.path.startswith('/api/'):
+            response.headers['Cache-Control'] = 'no-store'
+        return response
+
+if hasattr(app, 'errorhandler'):
+    @app.errorhandler(413)
+    def _too_large(_error):
+        return jsonify({'error': 'El archivo excede el límite de 300 MB.'}), 413
+
+
+# ─────────────────────────────────────────────
 #  RUTAS FLASK
 # ─────────────────────────────────────────────
 
-@app.route("/")
+@app.route('/')
 def index():
     return render_template_string(HTML)
 
 
-@app.route("/api/pagecount", methods=["POST"])
+@app.route('/api/pagecount', methods=['POST'])
 def pagecount():
-    """Cuenta páginas del PDF y lee metadatos básicos sin duplicar el archivo."""
-    pdf = request.files.get("pdf")
+    """Cuenta páginas y lee metadatos sin crear otra copia en disco."""
+    pdf = request.files.get('pdf')
     if not pdf:
-        return jsonify({"pages": None})
+        return jsonify({'pages': None})
     try:
         from pypdf import PdfReader
         pdf.stream.seek(0)
         reader = PdfReader(pdf.stream)
         info = reader.metadata or {}
-        title  = (info.get("/Title")  or "").strip()
-        author = (info.get("/Author") or "").strip()
         return jsonify({
-            "pages":  len(reader.pages),
-            "title":  title,
-            "author": author,
+            'pages': len(reader.pages),
+            'title': (info.get('/Title') or '').strip(),
+            'author': (info.get('/Author') or '').strip(),
         })
-    except Exception as e:
-        return jsonify({"pages": None, "error": str(e)})
+    except Exception:
+        return jsonify({'pages': None, 'error': 'No se pudo leer el PDF.'})
     finally:
         try:
             pdf.stream.seek(0)
-        except Exception:
+        except (OSError, AttributeError):
             pass
 
 
-@app.route("/api/convert", methods=["POST"])
+@app.route('/api/convert', methods=['POST'])
 def convert():
-    """Inicia la conversión en un hilo secundario."""
-    pdf = request.files.get("pdf")
+    """Inicia hasta dos conversiones aisladas en procesos hijos independientes."""
+    pdf = request.files.get('pdf')
     if not pdf:
-        return jsonify({"error": "No se recibió ningún PDF"}), 400
+        return jsonify({'error': 'No se recibió ningún PDF'}), 400
+    if not pdf.filename or Path(pdf.filename).suffix.lower() != '.pdf':
+        return jsonify({'error': 'Selecciona un archivo con extensión .pdf.'}), 400
 
-    # E03: rechazar opciones OCR inválidas antes de guardar el PDF o crear el trabajo.
-    # El campo puede estar vacío cuando OCR está desactivado; no se utiliza entonces.
-    ocr_mode = request.form.get("ocr_mode", "auto").strip().lower()
-    ocr_lang = request.form.get("ocr_lang", "spa+eng").strip() or "spa+eng"
-    if ocr_mode not in {"off", "auto", "force"}:
-        return jsonify({"error": "Modo OCR inválido: use off, auto o force."}), 400
+    ocr_mode = request.form.get('ocr_mode', 'auto').strip().lower()
+    ocr_lang = request.form.get('ocr_lang', 'spa+eng').strip() or 'spa+eng'
+    if ocr_mode not in {'off', 'auto', 'force'}:
+        return jsonify({'error': 'Modo OCR inválido: use off, auto o force.'}), 400
     valid_ocr_lang = bool(re.fullmatch(
-        r"[A-Za-z][A-Za-z0-9_/-]{1,31}(?:\+[A-Za-z][A-Za-z0-9_/-]{1,31}){0,7}", ocr_lang
+        r'[A-Za-z][A-Za-z0-9_/-]{1,31}(?:\+[A-Za-z][A-Za-z0-9_/-]{1,31}){0,7}', ocr_lang
     ))
-    if not valid_ocr_lang and ocr_mode != "off":
-        return jsonify({"error": "Idiomas OCR inválidos: use códigos como spa, eng o spa+eng."}), 400
-    if not valid_ocr_lang:  # el idioma no importa cuando OCR está desactivado
-        ocr_lang = "spa+eng"
+    if not valid_ocr_lang and ocr_mode != 'off':
+        return jsonify({'error': 'Idiomas OCR inválidos: use códigos como spa, eng o spa+eng.'}), 400
+    if not valid_ocr_lang:
+        ocr_lang = 'spa+eng'
+
+    cover = request.files.get('cover')
+    if cover and cover.filename and Path(cover.filename).suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp'}:
+        return jsonify({'error': 'La portada debe ser JPG, PNG o WEBP.'}), 400
 
     job_id = uuid.uuid4().hex
+    with JOBS_LOCK:
+        active = sum(job.get('status') == 'running' for job in JOBS.values())
+        if active >= MAX_ACTIVE_JOBS:
+            return jsonify({'error': 'Hay dos conversiones en curso. Espera a que termine una.'}), 429
+        # Reservar espacio antes de copiar los archivos recibidos.
+        JOBS[job_id] = {
+            'status': 'running', 'log': '', 'output_path': None,
+            'filename': '', 'size_kb': 0, 'chapters': 0, 'images': 0,
+            'ocr_pages': 0, 'created_at': time.time(), 'job_dir': None,
+        }
+
     job_dir = JOBS_DIR / _make_job_dir_name(pdf.filename)
-    inputs_dir = job_dir / "inputs"
-    inputs_dir.mkdir(parents=True, exist_ok=True)
-
-    # En una app web local el navegador no expone una ruta reutilizable al archivo original,
-    # así que guardamos UNA sola copia de trabajo persistente para el hilo de conversión.
-    safe_name = _sanitize_stem(Path(pdf.filename).stem if pdf.filename else "libro", default="libro")
-    pdf_path = inputs_dir / f"{safe_name}.pdf"
-    pdf.save(str(pdf_path))
-
-    cover_path = None
-    cover = request.files.get("cover")
-    if cover and cover.filename:
-        ext = Path(cover.filename).suffix or ".jpg"
-        cover_path = inputs_dir / f"cover{ext}"
-        cover.save(str(cover_path))
-
-    config = {
-        "title":     request.form.get("title", "").strip(),
-        "author":    request.form.get("author", "").strip(),
-        "lang":      request.form.get("lang", "es").strip() or "es",
-        "verbose":   request.form.get("verbose", "0") == "1",
-        "publisher": "",
-        "date":      "2026",
-        "ocr_mode":  ocr_mode,
-        "ocr_lang":  ocr_lang,
-        "ocr_dpi":   300,
-        "ocr_min_text_chars": 90,
-        "ocr_garbage_threshold": 0.22,
-        "ocr_psm": 3,
-        "ocr_oem": 3,
-        "tesseract_cmd": request.form.get("tesseract_cmd", "").strip(),
-    }
-
-    JOBS[job_id] = {"status": "running", "log": "", "output_path": None,
-                    "filename": "", "size_kb": 0, "chapters": 0, "images": 0, "ocr_pages": 0,
-                    "job_dir": str(job_dir)}
-
-    t = threading.Thread(target=_run_conversion,
-                         args=(job_id, pdf_path, cover_path, config, job_dir),
-                         daemon=True)
-    t.start()
-    return jsonify({"job_id": job_id})
+    try:
+        inputs_dir = job_dir / 'inputs'
+        inputs_dir.mkdir(parents=True, exist_ok=False)
+        safe_stem = _sanitize_stem(Path(pdf.filename).stem, 'libro')[:80]
+        pdf_path = inputs_dir / f'{safe_stem}.pdf'
+        pdf.save(str(pdf_path))
+        cover_path = None
+        if cover and cover.filename:
+            ext = Path(cover.filename).suffix.lower()
+            cover_path = inputs_dir / f'cover{ext}'
+            cover.save(str(cover_path))
+        config = {
+            'title': request.form.get('title', '').strip()[:300],
+            'author': request.form.get('author', '').strip()[:300],
+            'lang': request.form.get('lang', 'es').strip()[:30] or 'es',
+            'verbose': request.form.get('verbose', '0') == '1',
+            'publisher': '', 'date': str(datetime.now().year),
+            'ocr_mode': ocr_mode, 'ocr_lang': ocr_lang,
+            'ocr_dpi': 300, 'ocr_min_text_chars': 90,
+            'ocr_garbage_threshold': 0.22, 'ocr_psm': 3, 'ocr_oem': 3,
+            'tesseract_cmd': '',  # Sólo autodetección segura; sin ejecutables desde HTTP.
+        }
+        JOBS[job_id]['job_dir'] = str(job_dir)
+        t = threading.Thread(target=_run_conversion,
+                             args=(job_id, pdf_path, cover_path, config, job_dir), daemon=True)
+        t.start()
+    except Exception:
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify({'error': 'No se pudo iniciar la conversión.'}), 500
+    return jsonify({'job_id': job_id})
 
 
 def _run_conversion(job_id, pdf_path, cover_path, config, job_dir):
-    """Ejecuta la conversión y guarda el log en JOBS."""
-    import io as _io
-    import sys as _sys
-
-    # Redirigir stdout al log del job
-    log_lines = []
-
-    class LogCapture:
-        def write(self, s):
-            log_lines.append(s)
-            JOBS[job_id]["log"] = "".join(log_lines)
-        def flush(self): pass
-
-    old_stdout = _sys.stdout
-    _sys.stdout = LogCapture()
-
+    """Lanza el motor en otro proceso: stdout/Tesseract quedan aislados por job."""
+    process = None
     try:
-        # Importar/recargar el módulo principal
-        script_dir = Path(__file__).parent
-        if str(script_dir) not in _sys.path:
-            _sys.path.insert(0, str(script_dir))
+        settings_path = job_dir / 'settings.json'
+        result_path = job_dir / 'result.json'
+        work_epub = job_dir / 'resultado.epub'
+        settings_path.write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
+        command = [
+            sys.executable, '-u', '-m', 'converter.job_worker', str(pdf_path),
+            str(cover_path) if cover_path else '-', str(settings_path),
+            str(work_epub), str(result_path),
+        ]
+        # No shell=True, no rutas arbitrarias a programas proporcionadas por el cliente.
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+        process = subprocess.Popen(
+            command, cwd=str(Path(__file__).resolve().parent),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1,
+            creationflags=flags, env={**os.environ, 'PYTHONIOENCODING': 'utf-8'},
+        )
 
-        import importlib
-        import pdf2epub as p2e
-        p2e = importlib.reload(p2e)
+        def receive_log():
+            for line in process.stdout:
+                # El log se trunca en longitud, sin almacenar horas de salida en RAM.
+                old = JOBS[job_id]['log']
+                JOBS[job_id]['log'] = (old + line)[-MAX_LOG_CHARS:]
 
-        print(f"\n{'='*55}")
-        print(f"  PDF → EPUB Converter  |  Perfil: CoTE")
-        print(f"{'='*55}")
-
-        # Metadatos — resolver título antes de definir output_path
-        pdf_title, pdf_author = p2e.guess_title_author(str(pdf_path))
-        meta = {
-            "title":     config["title"]  or pdf_title  or pdf_path.stem,
-            "author":    config["author"] or pdf_author or "Desconocido",
-            "publisher": config.get("publisher", ""),
-            "lang":      config["lang"],
-            "date":      config.get("date", "2026"),
-        }
-        print(f"  Título : {meta['title']}")
-        print(f"  Autor  : {meta['author']}")
-        print()
-
-        # Nombre del EPUB = título sanitizado
-        import re as _re2
-        epub_name = _re2.sub(r'[^\w\s\-áéíóúüñÁÉÍÓÚÜÑ]', '', meta["title"]).strip()
-        epub_name = epub_name[:80] or pdf_path.stem  # máximo 80 chars
-        output_path = _unique_export_path(epub_name)
-        print(f"  Carpeta job : {job_dir}")
-        print(f"  Export EPUB : {output_path}")
-
-        print("▶ FASE 1 — Extrayendo texto e imágenes del PDF...")
-        raw_pages, images = p2e.extract_pdf_content(str(pdf_path))
-
-        print("\n▶ FASE 1.5 — Evaluando OCR...")
-        raw_pages, ocr_stats = p2e.apply_ocr_to_pages(str(pdf_path), raw_pages, config)
-
-        print("\n▶ FASE 2 — Limpiando texto...")
-        pages_paragraphs = p2e.clean_text_per_page(raw_pages, config)
-        p2e.check_cleaned_pages(raw_pages, pages_paragraphs)
-        clean = "\n\n".join(p for page in pages_paragraphs for p in page)
-
-        print("\n▶ FASE 3 — Detectando capítulos...")
-        chapters, page_to_chapter = p2e.detect_chapters(clean, config,
-                                                         pages_paragraphs=pages_paragraphs)
-        meta['excluded_pages'] = config.get('_excluded_pages', [])
-        if not chapters:
-            all_paras = [p for p in clean.split("\n\n") if p.strip()]
-            chapters = [{"title": meta["title"], "subtitle": "", "paragraphs": all_paras,
-                         "first_page_idx": 0}]
-            page_to_chapter = [0] * len(raw_pages)
-
-        p2e.check_chapter_coverage(pages_paragraphs, chapters, meta['excluded_pages'])
-
-        p2e.detect_dialog_system(chapters)
-
-        print("\n▶ FASE 4 — Generando EPUB...")
-        cover = str(cover_path) if cover_path and cover_path.exists() else None
-        if cover:
-            print(f"  Portada     : manual ({cover_path.name})")
-        else:
-            print("  Portada     : automática (primera imagen útil del PDF)")
-        p2e.create_epub(chapters, meta, str(output_path),
-                        cover_image_path=cover,
-                        images=images,
-                        raw_pages=raw_pages,
-                        pages_paragraphs=pages_paragraphs,
-                        page_to_chapter=page_to_chapter)
-
-        size_kb = round(output_path.stat().st_size / 1024, 1)
+        log_thread = threading.Thread(target=receive_log, daemon=True)
+        log_thread.start()
+        try:
+            code = process.wait(timeout=JOB_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise RuntimeError('Conversión cancelada: excedió el límite de 2 horas.')
+        finally:
+            log_thread.join(timeout=5)
+        if not result_path.exists():
+            raise RuntimeError(f'El proceso de conversión terminó sin resultado (código {code}).')
+        result = json.loads(result_path.read_text(encoding='utf-8'))
+        if code != 0 or not result.get('ok'):
+            raise RuntimeError(result.get('error') or f'El conversor terminó con código {code}.')
+        if not work_epub.is_file() or work_epub.stat().st_size == 0:
+            raise RuntimeError('El conversor no generó el EPUB esperado.')
+        with EXPORT_LOCK:
+            filename_stem = _sanitize_stem(result.get('title', pdf_path.stem), 'libro')
+            final_path = _unique_export_path(filename_stem)
+            os.replace(work_epub, final_path)
         JOBS[job_id].update({
-            "status":      "done",
-            "output_path": str(output_path),
-            "filename":    output_path.name,
-            "size_kb":     size_kb,
-            "chapters":    len(chapters),
-            "images":      len(images),
-            "ocr_pages":   int(ocr_stats.get("pages_replaced", 0)),
+            'status': 'done', 'output_path': str(final_path),
+            'filename': final_path.name,
+            'size_kb': round(final_path.stat().st_size / 1024, 1),
+            'chapters': result['chapters'], 'images': result['images'],
+            'ocr_pages': result['ocr_pages'],
         })
-
-    except Exception:
-        JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["error"]  = traceback.format_exc().strip().split("\n")[-1]
-        print(f"\n❌ Error:\n{traceback.format_exc()}")
+    except Exception as exc:
+        JOBS[job_id].update({'status': 'error', 'error': f'{type(exc).__name__}: {exc}'})
     finally:
-        _sys.stdout = old_stdout
+        if process and process.poll() is None:
+            process.kill()
+            process.wait()
+        # Los PDF subidos, portadas y configuraciones internas NO se conservan.
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
-@app.route("/api/status/<job_id>")
+@app.route('/api/status/<job_id>')
 def status(job_id):
-    job = JOBS.get(job_id)
-    if not job:
-        return jsonify({"status": "not_found"}), 404
-    return jsonify(job)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({'status': 'not_found'}), 404
+        # No revelar paths ni configuraciones del servidor a través de la API.
+        public = {key: job.get(key) for key in
+                  ('status', 'log', 'filename', 'size_kb', 'chapters', 'images', 'ocr_pages', 'error')
+                  if key in job}
+    return jsonify(public)
 
 
-@app.route("/api/download/<job_id>")
+@app.route('/api/download/<job_id>')
 def download(job_id):
-    job = JOBS.get(job_id)
-    if not job or job["status"] != "done":
-        return "No disponible", 404
-    return send_file(job["output_path"], as_attachment=True,
-                     download_name=job["filename"],
-                     mimetype="application/epub+zip")
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job or job['status'] != 'done':
+            return 'No disponible', 404
+        path = job['output_path']
+        name = job['filename']
+    if not path or not Path(path).is_file():
+        return 'Archivo vencido o eliminado', 404
+    return send_file(path, as_attachment=True, download_name=name,
+                     mimetype='application/epub+zip')
 
 
 # ─────────────────────────────────────────────
 #  PUNTO DE ENTRADA
 # ─────────────────────────────────────────────
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     port = 7474
-    url  = f"http://localhost:{port}"
-    print(f"\n  📚 pdf2epub — Interfaz Web")
-    print(f"  Abriendo {url} ...")
-    print(f"  Presiona Ctrl+C para detener.\n")
+    url = f'http://127.0.0.1:{port}'
+    print('\n  📚 pdf2epub — Interfaz Web')
+    print(f'  Abriendo {url} ...')
+    print('  Presiona Ctrl+C para detener.\n')
     threading.Timer(1.2, lambda: webbrowser.open(url)).start()
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host='127.0.0.1', port=port, debug=False, use_reloader=False)
