@@ -676,6 +676,9 @@ async function startConversion() {
   fd.append('title',   document.getElementById('f-title').value);
   fd.append('author',  document.getElementById('f-author').value);
   fd.append('lang',    document.getElementById('f-lang').value || 'es');
+  // E03: enviar exactamente la modalidad y los idiomas elegidos en pantalla.
+  fd.append('ocr_mode', document.getElementById('f-ocr-mode').value);
+  fd.append('ocr_lang', document.getElementById('f-ocr-lang').value.trim());
   fd.append('verbose', document.getElementById('f-verbose').checked ? '1' : '0');
 
   try {
@@ -804,6 +807,20 @@ def convert():
     if not pdf:
         return jsonify({"error": "No se recibió ningún PDF"}), 400
 
+    # E03: rechazar opciones OCR inválidas antes de guardar el PDF o crear el trabajo.
+    # El campo puede estar vacío cuando OCR está desactivado; no se utiliza entonces.
+    ocr_mode = request.form.get("ocr_mode", "auto").strip().lower()
+    ocr_lang = request.form.get("ocr_lang", "spa+eng").strip() or "spa+eng"
+    if ocr_mode not in {"off", "auto", "force"}:
+        return jsonify({"error": "Modo OCR inválido: use off, auto o force."}), 400
+    valid_ocr_lang = bool(re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_/-]{1,31}(?:\+[A-Za-z][A-Za-z0-9_/-]{1,31}){0,7}", ocr_lang
+    ))
+    if not valid_ocr_lang and ocr_mode != "off":
+        return jsonify({"error": "Idiomas OCR inválidos: use códigos como spa, eng o spa+eng."}), 400
+    if not valid_ocr_lang:  # el idioma no importa cuando OCR está desactivado
+        ocr_lang = "spa+eng"
+
     job_id = uuid.uuid4().hex
     job_dir = JOBS_DIR / _make_job_dir_name(pdf.filename)
     inputs_dir = job_dir / "inputs"
@@ -829,8 +846,8 @@ def convert():
         "verbose":   request.form.get("verbose", "0") == "1",
         "publisher": "",
         "date":      "2026",
-        "ocr_mode":  request.form.get("ocr_mode", "auto").strip() or "auto",
-        "ocr_lang":  request.form.get("ocr_lang", "spa+eng").strip() or "spa+eng",
+        "ocr_mode":  ocr_mode,
+        "ocr_lang":  ocr_lang,
         "ocr_dpi":   300,
         "ocr_min_text_chars": 90,
         "ocr_garbage_threshold": 0.22,

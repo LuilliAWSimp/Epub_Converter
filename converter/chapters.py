@@ -58,6 +58,32 @@ TOC_KEYWORDS = (
 
 
 
+def _is_toc_title_line(text: str) -> bool:
+    """Identifica un título de índice real; no palabras en medio de la novela."""
+    text = _normalize_heading_text(text).strip(':').strip()
+    return bool(re.fullmatch(
+        r'(?:tabla\s+de\s+contenidos?|contenidos?|table\s+of\s+contents|contents|[íi]ndice|toc)',
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+
+def _is_safe_subtitle(text: str) -> bool:
+    """Prefiere conservar una frase narrativa antes que convertirla en subtítulo."""
+    line = _normalize_heading_text(text)
+    if not looks_like_section_subtitle(line):
+        return False
+    # En español, una oración normal suele terminar con puntuación terminal.
+    # Si es ambiguo, dejarla en el cuerpo y no perderla en el índice.
+    if re.search(r'[.!?…;:]["”’»]*$', line):
+        return False
+    # Encabezados de dos palabras como «La Llegada» se conservan, pero una
+    # oración de varias palabras con una sola mayúscula no se consume.
+    if len(line) > 85 or len(line.split()) > 10:
+        return False
+    return True
+
+
 def _toc_entry_score(text: str) -> int:
     text = _normalize_heading_text(text)
     lower = text.lower()
@@ -71,7 +97,7 @@ def _toc_entry_score(text: str) -> int:
     has_pipe = '|' in text
     trailing_page = bool(re.search(r'\b\d{1,4}$', text))
 
-    if any(k in lower for k in TOC_KEYWORDS):
+    if _is_toc_title_line(text):
         score += 4
     if shortish and has_section_name:
         score += 2
@@ -87,22 +113,20 @@ def _toc_entry_score(text: str) -> int:
 def _is_probable_toc_page(page_paragraphs: list[str]) -> bool:
     if not page_paragraphs:
         return False
-    joined = _normalize_heading_text(" ".join(page_paragraphs))
-    lower = joined.lower()
-    if any(k in lower for k in TOC_KEYWORDS):
-        return True
-    scores = [_toc_entry_score(p) for p in page_paragraphs]
-    strong = sum(1 for s in scores if s >= 3)
-    medium = sum(1 for s in scores if s >= 2)
-    chapter_mentions = len(re.findall(r'(cap[ií]tulo|chapter|pr[óo]logo|ep[ií]logo|afterword)', lower))
-    page_numbers = len(re.findall(r'\b\d{1,4}\b', lower))
-    leader_count = len(re.findall(r'\.{2,}', joined))
-    return (
-        strong >= 2
-        or (medium >= 3 and page_numbers >= 3)
-        or (chapter_mentions >= 3 and page_numbers >= 3)
-        or (chapter_mentions >= 3 and leader_count >= 2)
-    )
+    # Una frase como «El contenido de la carta era inquietante» NO es un TOC.
+    # Solo cuenta como título si aparece aislado entre las primeras líneas.
+    visible = [_normalize_heading_text(p) for p in page_paragraphs if _normalize_heading_text(p)]
+    has_title = any(_is_toc_title_line(p) for p in visible[:2])
+    scored_entries = [p for p in visible if not _is_toc_title_line(p)]
+    scores = [_toc_entry_score(p) for p in scored_entries]
+    medium = sum(1 for score in scores if score >= 2)
+    strong = sum(1 for score in scores if score >= 3)
+    page_refs = sum(1 for p in scored_entries if _parse_toc_entry(p) is not None)
+    if has_title:
+        return page_refs >= 1 or medium >= 2 or len(scored_entries) == 0
+    # Índices sin encabezado: dos entradas numeradas distintas, no párrafos
+    # que simplemente mencionen «capítulo» o números ordinarios.
+    return page_refs >= 2 or (strong >= 3 and medium >= 3)
 
 
 _ROMAN_VALUES = {
@@ -202,7 +226,7 @@ def _parse_toc_entry(text: str) -> dict | None:
     if chap_m:
         label = chap_m.group(1)
         subtitle = _normalize_heading_text(chap_m.group(2) or '')
-        title_label = label.title() if str(label).isalpha() and not str(label).isdigit() else label
+        title_label = label.upper() if _roman_to_int(label) else (label.title() if str(label).isalpha() else label)
         return {
             'kind': 'chapter',
             'title': f'Capítulo {title_label}',
@@ -467,7 +491,7 @@ def _detect_page_heading(page_paragraphs: list[str], allow_terminal: bool = True
         if pattern.match(first) and _looks_like_short_heading(first):
             consume = heading_idx + 1
             subtitle = ''
-            if rest and looks_like_section_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
+            if rest and _is_safe_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
                 second_is_same_special = any(pat.match(rest[0]) for _, pat in SPECIAL_SECTION_PATTERNS)
                 if kind == 'afterword' and re.match(r'^(?:palabras del autor)$', rest[0], re.IGNORECASE):
                     subtitle = rest[0]
@@ -475,47 +499,58 @@ def _detect_page_heading(page_paragraphs: list[str], allow_terminal: bool = True
                 elif not second_is_same_special and not CHAPTER_PATTERNS[0].match(rest[0]):
                     subtitle = rest[0]
                     consume += 1
-            return {'kind': kind, 'title': _format_special_heading(kind, first), 'subtitle': subtitle, 'consume': consume}
+            return {'heading_index': heading_idx, 'kind': kind, 'title': _format_special_heading(kind, first), 'subtitle': subtitle, 'consume': consume}
 
     m = CHAPTER_PATTERNS[0].match(first)
     if m:
         label = m.group(1)
         subtitle = (m.group(2) or '').strip()
         short_heading = _looks_like_short_heading(first)
+        # El subtítulo de la propia línea no debe tragarse una frase narrativa.
+        if subtitle and not _is_safe_subtitle(subtitle):
+            # Un separador ':' explícito suele identificar un título real,
+            # incluso con punto final: «Capítulo III: El desenlace.»
+            explicit_title = bool(re.match(
+                r'(?i)^(?:cap[ií]tulo|chapter|cap\.)\s*(?:\d+|[IVXLCDM]+|extra|especial)\s*:',
+                first,
+            ))
+            if not explicit_title or len(subtitle) > 90:
+                return None
         # Si el extractor pegó el título con el primer párrafo, no consumimos
         # esa línea para no perder texto. Esto crea un corte de capítulo fiable
         # aunque el subtítulo no pueda recuperarse perfecto.
         consume = heading_idx + 1 if short_heading else heading_idx
-        if short_heading and not subtitle and rest and looks_like_section_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
+        if short_heading and not subtitle and rest and _is_safe_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
             if not any(pat.match(rest[0]) for _, pat in SPECIAL_SECTION_PATTERNS) and not CHAPTER_PATTERNS[0].match(rest[0]):
                 subtitle = rest[0]
                 consume += 1
         if not short_heading:
             subtitle = ''
-        title = f'Capítulo {label.title() if str(label).isalpha() else label}'
-        return {'kind': 'chapter', 'title': title, 'subtitle': subtitle, 'consume': consume}
+        title_label = label.upper() if _roman_to_int(label) else (label.title() if str(label).isalpha() else label)
+        title = f'Capítulo {title_label}'
+        return {'heading_index': heading_idx, 'kind': 'chapter', 'title': title, 'subtitle': subtitle, 'consume': consume}
 
     m = CHAPTER_PATTERNS[1].match(first)
     if m and _looks_like_short_heading(first):
         label = m.group(1)
         subtitle = (m.group(2) or '').strip()
         consume = heading_idx + 1
-        if not subtitle and rest and looks_like_section_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
+        if not subtitle and rest and _is_safe_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
             subtitle = rest[0]
             consume += 1
-        return {'kind': 'part', 'title': f'Parte {label}', 'subtitle': subtitle, 'consume': consume}
+        return {'heading_index': heading_idx, 'kind': 'part', 'title': f'Parte {label}', 'subtitle': subtitle, 'consume': consume}
 
     if CHAPTER_PATTERNS[2].match(first):
         subtitle = ''
         consume = heading_idx + 1
-        if rest and looks_like_section_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
+        if rest and _is_safe_subtitle(rest[0]) and _toc_entry_score(rest[0]) < 2:
             subtitle = rest[0]
             consume += 1
-        return {'kind': 'short_story', 'title': 'Short Story', 'subtitle': subtitle, 'consume': consume}
+        return {'heading_index': heading_idx, 'kind': 'short_story', 'title': 'Short Story', 'subtitle': subtitle, 'consume': consume}
 
     m = CHAPTER_PATTERNS[3].match(first)
-    if m and _looks_like_short_heading(first):
-        return {'kind': 'chapter', 'title': f'Capítulo {m.group(1)}', 'subtitle': (m.group(2) or '').strip(), 'consume': heading_idx + 1}
+    if m and _looks_like_short_heading(first) and _is_safe_subtitle(m.group(2) or ''):
+        return {'heading_index': heading_idx, 'kind': 'chapter', 'title': f'Capítulo {m.group(1)}', 'subtitle': (m.group(2) or '').strip(), 'consume': heading_idx + 1}
 
     return None
 def detect_chapters(full_text: str, config: dict,
@@ -636,6 +671,16 @@ def detect_chapters(full_text: str, config: dict,
             elif not body_started and heading['kind'] in {'epilogue', 'afterword', 'acknowledgements'}:
                 heading = None
             if heading:
+                # Si el título aparece después de una frase en la página,
+                # esa frase pertenece a la sección anterior, nunca se descarta.
+                leading = visible_paras[:int(heading.get('heading_index', 0))]
+                if leading:
+                    if current_section is not None:
+                        current_section['paragraphs'].extend(leading)
+                    else:
+                        intro_paragraphs.extend(leading)
+                        if intro_first_page == -1:
+                            intro_first_page = pg_idx
                 flush_current()
                 current_section = {
                     'title': heading['title'],
