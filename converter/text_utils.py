@@ -52,7 +52,11 @@ def looks_like_section_subtitle(line: str) -> bool:
 
 
 def normalize_header_footer_candidate(line: str) -> str:
-    """Normaliza líneas candidatas a header/footer con número de página variable."""
+    """Normaliza SOLO numeración de margen conocida, nunca cifras de la prosa.
+
+    E02: sustituir todas las cifras producía colisiones entre frases legítimas
+    ("párrafo 1" / "párrafo 2"), que después se borraban por completo.
+    """
     s = re.sub(r'\s+', ' ', (line or '').strip())
     if not s:
         return ''
@@ -62,7 +66,8 @@ def normalize_header_footer_candidate(line: str) -> str:
     if re.fullmatch(r'[\-–—\s]*\d{1,4}[\-–—\s]*', s):
         return '<PAGE_NUM>'
 
-    s = re.sub(r'\b(P[áa]g(?:ina)?\.?\s*)\d{1,4}\b', r'\1<PAGE_NUM>', s, flags=re.IGNORECASE)
+    if re.fullmatch(r'(?:p[áa]g(?:ina)?\.?\s*|p\.?\s*)\d{1,4}', s, flags=re.IGNORECASE):
+        return '<PAGE_NUM>'
 
     if VARIABLE_PAGE_LINE_RE.fullmatch(s):
         s = re.sub(r'\d{1,4}\s*$', '<PAGE_NUM>', s)
@@ -70,12 +75,27 @@ def normalize_header_footer_candidate(line: str) -> str:
     if re.fullmatch(r'[\-–—\s]*<PAGE_NUM>[\-–—\s]*', s):
         return '<PAGE_NUM>'
 
-    s = re.sub(r'(?<!\w)\d{1,4}(?!\w)', '<PAGE_NUM>', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-
     if is_structural_heading_line(s):
         return ''
     return s
+
+
+def _margin_positions(lines: list[str]) -> set[int]:
+    """Posiciones de encabezado/pie de página; no incluir la prosa interior."""
+    nonempty = [i for i, line in enumerate(lines) if line.strip()]
+    return set(nonempty[:2] + nonempty[-2:])
+
+
+def _plausible_running_header(line: str) -> bool:
+    """No eliminar una oración narrativa aunque se repita entre páginas."""
+    stripped = line.strip()
+    if len(stripped) > 100 or len(stripped.split()) > 12:
+        return False
+    if re.search(r'[.!?…]["”’]?$', stripped) and not re.match(
+        r'^(?:p[áa]g(?:ina)?\.?\s*|p\.?\s*)\d+$', stripped, flags=re.IGNORECASE
+    ):
+        return False
+    return True
 
 
 def detect_repeated_lines(pages: list[str]) -> tuple[set[str], set[str]]:
@@ -86,13 +106,13 @@ def detect_repeated_lines(pages: list[str]) -> tuple[set[str], set[str]]:
     normalized_count: Counter = Counter()
 
     for page_text in pages:
-        lines = page_text.strip().splitlines()
-        candidates = lines[:3] + lines[-3:] if len(lines) >= 6 else lines
+        lines = page_text.splitlines()
+        candidates = (lines[i] for i in sorted(_margin_positions(lines)))
         seen_exact: set[str] = set()
         seen_normalized: set[str] = set()
         for line in candidates:
             stripped = re.sub(r'\s+', ' ', line.strip())
-            if not stripped or len(stripped) <= 2:
+            if not stripped or len(stripped) <= 2 or not _plausible_running_header(stripped):
                 continue
             if is_structural_heading_line(stripped):
                 continue
@@ -104,8 +124,10 @@ def detect_repeated_lines(pages: list[str]) -> tuple[set[str], set[str]]:
                 normalized_count[normalized] += 1
                 seen_normalized.add(normalized)
 
-    repeated_exact = {line for line, count in exact_count.items() if count >= HEADER_FOOTER_MIN_REPEAT}
-    repeated_normalized = {line for line, count in normalized_count.items() if count >= HEADER_FOOTER_MIN_REPEAT}
+    # Repetición en un porcentaje alto de páginas, con mínimo de cuatro.
+    min_repeat = max(HEADER_FOOTER_MIN_REPEAT, int(len(pages) * .45))
+    repeated_exact = {line for line, count in exact_count.items() if count >= min_repeat}
+    repeated_normalized = {line for line, count in normalized_count.items() if count >= min_repeat}
     return repeated_exact, repeated_normalized
 
 
@@ -143,8 +165,8 @@ def clean_text_per_page(raw_pages: list[str], config: dict) -> list[list[str]]:
                 print(f"    - {repr(l)}")
 
     HF_EXTRA_PATTERNS = [
-        re.compile(r'P[áa]gina\s+N[°º]?\s*\d+', re.IGNORECASE),
-        re.compile(r'\bpág(?:ina)?\s*\.?\s*\d+', re.IGNORECASE),
+        re.compile(r'^P[áa]gina\s+N[°º]?\s*\d+$', re.IGNORECASE),
+        re.compile(r'^\s*pág(?:ina)?\s*\.?\s*\d+\s*$', re.IGNORECASE),
         re.compile(r'^[\-–—]\s*\d+\s*[\-–—]$'),
         VARIABLE_PAGE_LINE_RE,
     ]
@@ -153,7 +175,9 @@ def clean_text_per_page(raw_pages: list[str], config: dict) -> list[list[str]]:
     result: list[list[str]] = []
     for page_idx, page_text in enumerate(raw_pages):
         page_lines: list[str] = []
-        for line in page_text.splitlines():
+        source_lines = page_text.splitlines()
+        margin = _margin_positions(source_lines)
+        for line_idx, line in enumerate(source_lines):
             stripped = re.sub(r'\s+', ' ', line.strip())
             if not stripped:
                 page_lines.append("")
@@ -161,13 +185,13 @@ def clean_text_per_page(raw_pages: list[str], config: dict) -> list[list[str]]:
 
             normalized = normalize_header_footer_candidate(stripped)
             should_remove = False
-            if stripped in repeated_lines:
+            if line_idx in margin and stripped in repeated_lines and _plausible_running_header(stripped):
                 should_remove = True
-            elif normalized and normalized in repeated_normalized:
+            elif line_idx in margin and normalized and normalized in repeated_normalized and _plausible_running_header(stripped):
                 should_remove = True
-            elif re.fullmatch(r'\d{1,4}', stripped):
+            elif line_idx in margin and re.fullmatch(r'\d{1,4}', stripped):
                 should_remove = True
-            elif any(p.search(stripped) for p in HF_EXTRA_PATTERNS):
+            elif line_idx in margin and any(p.fullmatch(stripped) for p in HF_EXTRA_PATTERNS):
                 should_remove = True
 
             # No eliminar headings narrativos legítimos.

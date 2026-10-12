@@ -648,8 +648,9 @@ def detect_chapters(full_text: str, config: dict,
                 consume = int(heading.get('consume', 1))
 
         content_paras = visible_paras[consume:]
-        if len(content_paras) <= 2 and _looks_like_visual_separator_text(' '.join(content_paras)):
-            content_paras = []
+        # E02: no descartar párrafos narrativos solo por ser breves. La antigua
+        # heurística los confundía con páginas visuales (<70 caracteres).
+        # Las páginas efectivamente vacías ya se gestionan por separado.
 
         if current_section is None:
             if content_paras:

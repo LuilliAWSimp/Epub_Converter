@@ -910,6 +910,7 @@ def _run_conversion(job_id, pdf_path, cover_path, config, job_dir):
 
         print("\n▶ FASE 2 — Limpiando texto...")
         pages_paragraphs = p2e.clean_text_per_page(raw_pages, config)
+        p2e.check_cleaned_pages(raw_pages, pages_paragraphs)
         clean = "\n\n".join(p for page in pages_paragraphs for p in page)
 
         print("\n▶ FASE 3 — Detectando capítulos...")
@@ -921,6 +922,8 @@ def _run_conversion(job_id, pdf_path, cover_path, config, job_dir):
             chapters = [{"title": meta["title"], "subtitle": "", "paragraphs": all_paras,
                          "first_page_idx": 0}]
             page_to_chapter = [0] * len(raw_pages)
+
+        p2e.check_chapter_coverage(pages_paragraphs, chapters, meta['excluded_pages'])
 
         p2e.detect_dialog_system(chapters)
 

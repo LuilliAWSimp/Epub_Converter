@@ -8,6 +8,7 @@ Extraído de pdf2epub.py sin cambios de comportamiento.
 import io
 import os
 import re
+import tempfile
 import uuid
 import zipfile
 
@@ -17,6 +18,7 @@ from converter.chapters import (
     _validate_spine_fragments,
 )
 from converter.image_filters import _flatten_image_for_mobile_compat
+from converter.integrity import ConversionIntegrityError, validate_epub_archive
 
 
 CSS_PROFILE = """\
@@ -250,18 +252,23 @@ def build_image_sequence_xhtml(images: list[dict], lang: str, title: str) -> str
         caption_html = f'\n<p class="centrado"><i>{escape_xml(img.get("caption", ""))}</i></p>' if img.get("caption") else ""
         body_parts.append(
             f'<div class="dimg fullblock">\n'
-            f'  <img alt="ilustración" src="../Images/{img["name"]}"/>\n'
+            f'  <img alt="ilustración" src="../Images/{escape_xml_attr(img["name"])}"/>\n'
             f'</div>{caption_html}'
         )
-    return XHTML_IMAGE_SEQUENCE_TEMPLATE.format(lang=lang, title=title, body="\n".join(body_parts))
+    return XHTML_IMAGE_SEQUENCE_TEMPLATE.format(lang=escape_xml_attr(lang), title=escape_xml(title), body="\n".join(body_parts))
 
 
 def escape_xml(text: str) -> str:
     """Escapa caracteres especiales para XML/HTML."""
-    text = text.replace("&", "&amp;")
+    text = str(text).replace("&", "&amp;")
     text = text.replace("<", "&lt;")
     text = text.replace(">", "&gt;")
     return text
+
+
+def escape_xml_attr(text: str) -> str:
+    """Como escape_xml, incluyendo comillas dentro de atributos XML."""
+    return escape_xml(text).replace('"', '&quot;').replace("'", '&apos;')
 
 
 def apply_inline_styles(text: str) -> str:
@@ -298,7 +305,7 @@ def inline_image_html(imgname: str, caption: str = "", layout: str = "inline") -
     extra_class = " fullblock" if layout == "fullblock" else ""
     return (
         f'<div class="dimg{extra_class}">\n'
-        f'  <img alt="ilustración" src="../Images/{imgname}"/>\n'
+        f'  <img alt="ilustración" src="../Images/{escape_xml_attr(imgname)}"/>\n'
         f'</div>{cap_html}'
     )
 
@@ -368,8 +375,8 @@ def chapter_fragment_to_xhtml(chapter: dict, start_idx: int, end_idx: int,
     body_html = "\n".join(body_parts)
 
     return XHTML_CHAPTER_TEMPLATE.format(
-        lang=lang,
-        title=f"{title}{': ' + subtitle if subtitle else ''}",
+        lang=escape_xml_attr(lang),
+        title=escape_xml(f"{title}{': ' + subtitle if subtitle else ''}"),
         body=body_html,
     )
 
@@ -378,16 +385,18 @@ def build_opf(meta: dict, manifest_items: list[dict], spine_idrefs: list[str], b
     """Genera el content.opf."""
 
     manifest_xml = "\n    ".join(
-        f'<item id="{item["id"]}" href="{item["href"]}" media-type="{item["media_type"]}"/>'
+        f'<item id="{escape_xml_attr(item["id"])}" href="{escape_xml_attr(item["href"])}" media-type="{escape_xml_attr(item["media_type"])}"/>'
         for item in manifest_items
     )
 
     spine_xml = "\n    ".join(
-        f'<itemref idref="{idref}"/>' for idref in spine_idrefs
+        f'<itemref idref="{escape_xml_attr(idref)}"/>' for idref in spine_idrefs
     )
 
     cover_item = next((i for i in manifest_items if i["id"] == "cover-image"), None)
     cover_meta = f'\n    <meta name="cover" content="cover-image"/>' if cover_item else ""
+    first_content_href = next((i['href'] for i in manifest_items
+                               if i['id'] in spine_idrefs and i['id'] != 'Portada'), 'Text/Portada.xhtml')
 
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <package version="2.0" unique-identifier="BookId"
@@ -396,10 +405,10 @@ def build_opf(meta: dict, manifest_items: list[dict], spine_idrefs: list[str], b
             xmlns:opf="http://www.idpf.org/2007/opf">
     <dc:title>{escape_xml(meta.get('title', 'Sin título'))}</dc:title>
     <dc:creator>{escape_xml(meta.get('author', 'Desconocido'))}</dc:creator>
-    <dc:language>{meta.get('lang', 'es')}</dc:language>
+    <dc:language>{escape_xml(meta.get('lang', 'es'))}</dc:language>
     <dc:publisher>{escape_xml(meta.get('publisher', ''))}</dc:publisher>
     <dc:identifier id="BookId" opf:scheme="UUID">urn:uuid:{book_id}</dc:identifier>
-    <dc:date>{meta.get('date', '2026')}</dc:date>{cover_meta}
+    <dc:date>{escape_xml(meta.get('date', '2026'))}</dc:date>{cover_meta}
   </metadata>
   <manifest>
     <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
@@ -411,7 +420,7 @@ def build_opf(meta: dict, manifest_items: list[dict], spine_idrefs: list[str], b
   </spine>
   <guide>
     <reference type="cover" title="Portada" href="Text/Portada.xhtml"/>
-    <reference type="text" title="Inicio" href="Text/001.xhtml"/>
+    <reference type="text" title="Inicio" href="{escape_xml_attr(first_content_href)}"/>
   </guide>
 </package>
 """
@@ -423,7 +432,7 @@ def build_ncx(meta: dict, nav_points: list[dict], book_id: str) -> str:
     for i, point in enumerate(nav_points, 1):
         nav_xml_parts.append(f"""    <navPoint id="navPoint-{i}" playOrder="{i}">
       <navLabel><text>{escape_xml(point['label'])}</text></navLabel>
-      <content src="{point['src']}"/>
+      <content src="{escape_xml_attr(point['src'])}"/>
     </navPoint>""")
 
     nav_xml = "\n".join(nav_xml_parts)
@@ -431,7 +440,7 @@ def build_ncx(meta: dict, nav_points: list[dict], book_id: str) -> str:
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN"
   "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
-<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="{meta.get('lang','es')}">
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="{escape_xml_attr(meta.get('lang','es'))}">
   <head>
     <meta name="dtb:uid" content="urn:uuid:{book_id}"/>
     <meta name="dtb:depth" content="1"/>
@@ -457,7 +466,7 @@ def build_container_xml() -> str:
 
 
 def build_cover_xhtml(lang: str = "es") -> str:
-    return XHTML_COVER_TEMPLATE.format(lang=lang)
+    return XHTML_COVER_TEMPLATE.format(lang=escape_xml_attr(lang))
 
 
 def build_image_page_xhtml(img: dict, lang: str, title: str) -> str:
@@ -466,10 +475,10 @@ def build_image_page_xhtml(img: dict, lang: str, title: str) -> str:
     if img.get("caption"):
         caption_html = f'\n<p class="centrado"><i>{escape_xml(img["caption"])}</i></p>'
     return XHTML_IMAGE_PAGE_TEMPLATE.format(
-        lang=lang,
-        title=title,
+        lang=escape_xml_attr(lang),
+        title=escape_xml(title),
         alt="ilustración",
-        imgname=img["name"],
+        imgname=escape_xml_attr(img["name"]),
         caption_html=caption_html,
     )
 
@@ -532,7 +541,7 @@ def resolve_cover_image(cover_image_path: str | None = None,
     return None, "none", None
 
 
-def create_epub(chapters: list[dict], meta: dict, output_path: str,
+def _create_epub_unchecked(chapters: list[dict], meta: dict, output_path: str,
                 cover_image_path: str | None = None,
                 images: list[dict] | None = None,
                 raw_pages: list[str] | None = None,
@@ -850,7 +859,7 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
         else:
             print("  [EPUB] Portada: sin imagen, se usará portada tipográfica")
             zf.writestr("OEBPS/Text/Portada.xhtml", XHTML_CHAPTER_TEMPLATE.format(
-                lang=lang, title="Portada",
+                lang=escape_xml_attr(lang), title="Portada",
                 body=(f'<h1 class="titulo">{escape_xml(meta.get("title",""))}</h1>\n'
                       f'<h2 class="subtitulo">{escape_xml(meta.get("author",""))}</h2>'),
             ))
@@ -891,10 +900,10 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
                 zf.writestr(
                     f"OEBPS/Text/{ip_filename}",
                     XHTML_IMAGE_PAGE_TEMPLATE.format(
-                        lang=lang,
+                        lang=escape_xml_attr(lang),
                         title=escape_xml(title),
                         alt="ilustración",
-                        imgname=img["name"],
+                        imgname=escape_xml_attr(img["name"]),
                         caption_html=caption_html,
                     ),
                 )
@@ -908,7 +917,7 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
                 title = f"Ilustraciones {visual_counter}"
                 zf.writestr(
                     f"OEBPS/Text/{ip_filename}",
-                    build_image_sequence_xhtml(item["images"], lang=lang, title=escape_xml(title)),
+                    build_image_sequence_xhtml(item["images"], lang=lang, title=title),
                 )
                 manifest_items.append({"id": ip_id, "href": f"Text/{ip_filename}",
                                        "media_type": "application/xhtml+xml"})
@@ -947,8 +956,46 @@ def create_epub(chapters: list[dict], meta: dict, output_path: str,
         zf.writestr("OEBPS/toc.ncx",
                     build_ncx(meta, nav_points, book_uuid))
 
-    print(f"\n  ✅ EPUB generado: {output_path}")
-    size_kb = os.path.getsize(output_path) / 1024
-    print(f"     Tamaño: {size_kb:.1f} KB | "
-          f"Capítulos: {len(chapters)} | Imágenes: {len(images)}")
+
+
+def create_epub(chapters: list[dict], meta: dict, output_path: str,
+                cover_image_path: str | None = None,
+                images: list[dict] | None = None,
+                raw_pages: list[str] | None = None,
+                pages_paragraphs: list[list[str]] | None = None,
+                page_to_chapter: list | None = None) -> None:
+    """Publica el EPUB únicamente tras validar el archivo temporal completo.
+
+    Un fallo no sobreescribe una exportación anterior con un libro incompleto.
+    """
+    from xml.etree import ElementTree as ET
+
+    output_path = os.path.abspath(output_path)
+    destination = os.path.dirname(output_path)
+    os.makedirs(destination, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.epub_e02_', suffix='.epub', dir=destination)
+    os.close(fd)
+    try:
+        if not chapters and not images:
+            raise ConversionIntegrityError('El PDF no contiene texto ni ilustraciones exportables')
+        _create_epub_unchecked(chapters, meta, temporary, cover_image_path=cover_image_path,
+                               images=images, raw_pages=raw_pages,
+                               pages_paragraphs=pages_paragraphs,
+                               page_to_chapter=page_to_chapter)
+        # El motor convierte marcadores *cursiva* y **negrita** en nodos HTML.
+        # Se compara el texto renderizado, no los asteriscos originales.
+        expected_paragraphs = []
+        for chapter in chapters:
+            for paragraph in chapter.get('paragraphs', []):
+                expected_paragraphs.append(''.join(ET.fromstring(para_to_html(paragraph)).itertext()))
+        result = validate_epub_archive(temporary, expected_paragraphs)
+        os.replace(temporary, output_path)
+        print(f"  [Integridad E02] EPUB válido: {result['spine_documents']} documento(s) "
+              f"en lectura, {result['text_paragraphs']} párrafo(s) verificados")
+        print(f"\n  ✅ EPUB generado: {output_path}")
+        print(f"     Tamaño: {os.path.getsize(output_path) / 1024:.1f} KB | "
+              f"Capítulos: {len(chapters)} | Imágenes: {len(images or [])}")
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 

@@ -51,6 +51,7 @@ from converter.text_utils import (
     is_structural_heading_line,
     looks_like_section_subtitle,
 )
+from converter.integrity import check_cleaned_pages, check_chapter_coverage
 from converter.image_filters import (
     _encode_image_for_epub,
     _filter_decorative_images,
@@ -1647,6 +1648,7 @@ def main():
     # FASE 2: Limpieza
     print("\n▶ FASE 2 — Limpiando texto...")
     pages_paragraphs = clean_text_per_page(raw_pages, config)   # ← por página
+    check_cleaned_pages(raw_pages, pages_paragraphs)
     clean = "\n\n".join(p for page in pages_paragraphs for p in page)
 
     if config["verbose"]:
@@ -1665,6 +1667,8 @@ def main():
         chapters = [{"title": meta["title"], "subtitle": "", "paragraphs": all_paras,
                      "first_page_idx": 0}]
         page_to_chapter = [0] * len(raw_pages)
+
+    check_chapter_coverage(pages_paragraphs, chapters, meta['excluded_pages'])
 
     # Detectar sistema de diálogos
     detect_dialog_system(chapters)
