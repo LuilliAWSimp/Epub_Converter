@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """Extracción de texto/imágenes desde PDF y soporte OCR.
 
-Este módulo agrupa la lógica de lectura con pypdf/pdfminer/PyMuPDF,
-renderizado para OCR y helpers de Tesseract. La implementación fue movida
-sin cambios lógicos desde pdf2epub.py para mantener el comportamiento.
+Este módulo centraliza la lectura con pypdf/pdfminer/PyMuPDF, las imágenes
+editoriales y el OCR opcional mediante Tesseract. Se usa desde CLI y GUI.
 """
 
 import io
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -48,28 +49,71 @@ def get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _tesseract_works(command: str) -> bool:
+    """Detecta ejecutables rotos (por ejemplo, un .exe sin sus DLL)."""
+    try:
+        result = subprocess.run(
+            [command, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def get_tesseract_cmd(user_path=None):
-    """
-    Prioridad:
-    1) ruta pasada por usuario
-    2) tesseract embebido junto al proyecto / ejecutable
-    3) comando global del sistema
-    """
+    """Busca Tesseract usable, sin elegir .exe de Windows en otros sistemas."""
     if user_path:
-        user_path = str(user_path).strip().strip('"')
-        if user_path and Path(user_path).exists():
-            return user_path
+        command = str(user_path).strip().strip('"')
+        if not _tesseract_works(command):
+            raise RuntimeError(f"Tesseract no se puede ejecutar desde la ruta indicada: {command}")
+        return command
 
+    candidates = []
     base_dir = get_base_dir()
-    local = base_dir / "tesseract" / "tesseract.exe"
-    if local.exists():
-        return str(local)
+    if sys.platform == "win32":
+        candidates.append(base_dir / "tesseract" / "tesseract.exe")
+        for key in ("ProgramFiles", "ProgramFiles(x86)"):
+            if os.environ.get(key):
+                candidates.append(Path(os.environ[key]) / "Tesseract-OCR" / "tesseract.exe")
 
-    return "tesseract"
+    installed = shutil.which("tesseract")
+    if installed:
+        candidates.append(installed)
+
+    for candidate in candidates:
+        if _tesseract_works(str(candidate)):
+            return str(candidate)
+
+    raise RuntimeError(
+        "Tesseract OCR no está disponible o no puede ejecutarse. "
+        "Instala Tesseract OCR con idiomas spa y eng; "
+        "el tesseract.exe incluido necesita sus DLL en Windows."
+    )
+
+
+def configure_tesseract(config: dict | None = None) -> str:
+    """Configura el motor y evita un TESSDATA_PREFIX heredado de otro ejecutable."""
+    config = config or {}
+    tesseract_cmd = get_tesseract_cmd(config.get("tesseract_cmd"))
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+    # El paquete local puede aportar idiomas, pero el Tesseract instalado
+    # conoce su propio tessdata: no hay que forzar las rutas equivocadas.
+    bundled_dir = get_base_dir() / "tesseract"
+    executable = Path(tesseract_cmd)
+    if executable.parent.resolve() == bundled_dir.resolve():
+        tessdata_dir = bundled_dir / "tessdata"
+        if tessdata_dir.exists():
+            os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
+    return tesseract_cmd
 
 
 def _is_image_only_page(text: str) -> bool:
-    """Devuelve True si la página es prácticamente solo una imagen (sin texto real)."""
+    """Detecta páginas visuales con escaso texto real."""
     cleaned = _clean_page_number_only(text)
     compact = re.sub(r"\s+", " ", cleaned).strip()
     if len(compact) < IMAGE_PAGE_TEXT_THRESHOLD:
@@ -78,20 +122,6 @@ def _is_image_only_page(text: str) -> bool:
         return True
     return False
 
-
-def configure_tesseract(config: dict | None = None) -> str:
-    """Configura pytesseract para usar Tesseract local o del sistema."""
-    config = config or {}
-    tesseract_cmd = get_tesseract_cmd(config.get("tesseract_cmd"))
-    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-
-    tesseract_path = Path(tesseract_cmd)
-    if tesseract_path.exists():
-        tessdata_dir = tesseract_path.parent / "tessdata"
-        if tessdata_dir.exists():
-            os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
-
-    return pytesseract.pytesseract.tesseract_cmd
 
 def _should_ocr_page(text: str, config: dict) -> tuple[bool, str, float]:
     mode = (config.get('ocr_mode') or DEFAULT_OCR_MODE).lower()
@@ -128,7 +158,9 @@ def _render_page_to_png_bytes(pdf_path: str, page_index: int, dpi: int = DEFAULT
 def _ocr_png_bytes(png_bytes: bytes, config: dict) -> str:
     from PIL import Image
 
-    resolved_cmd = configure_tesseract(config)
+    # La conversión por lotes configura Tesseract una sola vez antes del bucle.
+    if not config.get('_ocr_engine_ready'):
+        configure_tesseract(config)
     lang = (config.get('ocr_lang') or DEFAULT_OCR_LANG).strip()
     psm = str(config.get('ocr_psm', 3)).strip()
     oem = str(config.get('ocr_oem', 3)).strip()
@@ -138,44 +170,66 @@ def _ocr_png_bytes(png_bytes: bytes, config: dict) -> str:
     return pytesseract.image_to_string(img, lang=lang, config=custom)
 
 def apply_ocr_to_pages(pdf_path: str, raw_pages: list[str], config: dict) -> tuple[list[str], dict]:
-    """Aplica OCR página por página cuando el modo/configuración lo requiere."""
+    """Aplica OCR sin ocultar fallos; en 'force' los errores son fatales."""
     mode = (config.get('ocr_mode') or DEFAULT_OCR_MODE).lower()
+    if mode not in {'off', 'auto', 'force'}:
+        raise ValueError(f"Modo OCR no reconocido: {mode}")
     stats = {
         'mode': mode,
         'applied': False,
+        'pages_attempted': 0,
         'pages_replaced': 0,
+        'pages_failed': 0,
         'page_indexes': [],
         'reasons': {},
+        'warnings': [],
     }
-
     if mode == 'off':
         print('  OCR: desactivado')
         return raw_pages, stats
 
+    # Comprobar primero si existe alguna página que requiere OCR. En modo
+    # automático no hace falta Tesseract para PDFs con texto correctamente extraído.
+    pending = [
+        (idx, reason) for idx, text in enumerate(raw_pages)
+        for needed, reason, _ in [_should_ocr_page(text, config)] if needed
+    ]
+    if not pending:
+        print('  OCR: no se detectaron páginas que requieran reconocimiento')
+        return raw_pages, stats
+
     try:
-        import pytesseract  # noqa: F401
         import fitz  # noqa: F401
         from PIL import Image  # noqa: F401
-    except Exception as e:
-        print(f'  ⚠️  OCR no disponible ({e}). Se usará extracción normal.')
+        resolved_cmd = configure_tesseract(config)
+        requested_lang = (config.get('ocr_lang') or DEFAULT_OCR_LANG).strip()
+        available_langs = set(pytesseract.get_languages(config=''))
+        missing = [language for language in requested_lang.split('+') if language not in available_langs]
+        if missing:
+            raise RuntimeError(
+                f"Faltan idiomas OCR: {', '.join(missing)}. "
+                f"Disponibles: {', '.join(sorted(available_langs))}"
+            )
+    except Exception as exc:
+        message = f'OCR no disponible: {exc}'
+        if mode == 'force':
+            raise RuntimeError(message) from exc
+        stats['pages_failed'] = len(pending)
+        stats['warnings'].append(message)
+        print(f'  ⚠️  {message}. Se conserva el texto original.')
         return raw_pages, stats
 
     replaced = list(raw_pages)
     dpi = int(config.get('ocr_dpi', DEFAULT_OCR_DPI))
-    print(f'  OCR: modo={mode} | lang={config.get("ocr_lang", DEFAULT_OCR_LANG)} | dpi={dpi}')
-    try:
-        print(f'  OCR: tesseract={configure_tesseract(config)}')
-    except Exception:
-        pass
+    print(f'  OCR: modo={mode} | lang={requested_lang} | dpi={dpi}')
+    print(f'  OCR: tesseract={resolved_cmd}')
+    ocr_config = dict(config, _ocr_engine_ready=True)
 
-    for idx, original_text in enumerate(raw_pages):
-        must_ocr, reason, score = _should_ocr_page(original_text, config)
-        if not must_ocr:
-            continue
-
+    for idx, reason in pending:
+        stats['pages_attempted'] += 1
         try:
             png_bytes = _render_page_to_png_bytes(pdf_path, idx, dpi=dpi)
-            ocr_text = _ocr_png_bytes(png_bytes, config).strip()
+            ocr_text = _ocr_png_bytes(png_bytes, ocr_config).strip()
             if ocr_text:
                 replaced[idx] = ocr_text
                 stats['pages_replaced'] += 1
@@ -184,18 +238,28 @@ def apply_ocr_to_pages(pdf_path: str, raw_pages: list[str], config: dict) -> tup
                 stats['applied'] = True
                 print(f'    OCR página {idx+1}: {reason}')
             else:
-                print(f'    OCR página {idx+1}: sin texto reconocible, se conserva extracción normal')
-        except Exception as e:
-            print(f'    OCR página {idx+1}: fallo ({e}), se conserva extracción normal')
+                print(f'    ⚠️  OCR página {idx+1}: sin texto reconocible; se conserva extracción normal')
+                stats['warnings'].append(f'Página {idx+1}: OCR no encontró texto')
+        except Exception as exc:
+            stats['pages_failed'] += 1
+            message = f'OCR página {idx+1}: fallo ({exc})'
+            if mode == 'force':
+                raise RuntimeError(message) from exc
+            stats['warnings'].append(message)
+            print(f'    ⚠️  {message}; se conserva extracción normal')
 
+    if mode == 'force' and stats['pages_replaced'] == 0:
+        raise RuntimeError('OCR forzado no reconoció texto en ninguna página. Verifica el PDF y los idiomas.')
     if stats['pages_replaced'] == 0:
-        print('  OCR: no fue necesario reemplazar páginas')
+        print('  OCR: ninguna página reemplazada')
     else:
         joined = ', '.join(str(i + 1) for i in stats['page_indexes'][:12])
         extra = '' if len(stats['page_indexes']) <= 12 else '…'
         print(f"  OCR: páginas reemplazadas = {stats['pages_replaced']} ({joined}{extra})")
-
+    if stats['warnings']:
+        print(f"  ⚠️  OCR finalizó con {len(stats['warnings'])} advertencia(s)")
     return replaced, stats
+
 
 def _build_image_record(page_idx: int,
                         img_counter: int,
